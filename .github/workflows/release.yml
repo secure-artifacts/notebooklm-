@@ -1,0 +1,43 @@
+name: Release Browser Extension
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate extension manifest
+        run: node -e "JSON.parse(require('fs').readFileSync('manifest.json', 'utf8')); console.log('manifest valid')"
+
+      - name: Package extension
+        run: |
+          mkdir -p package
+          cp manifest.json README.md package/
+          cp -R assets src package/
+          cd package
+          zip -r "../notebooklm-transcript-${{ github.ref_name }}.zip" .
+          cd ..
+          test "$(unzip -Z1 "notebooklm-transcript-${{ github.ref_name }}.zip" | grep -c '^manifest.json$')" -eq 1
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "notebooklm-transcript-*.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "notebooklm-transcript-*.zip"
+          generate_release_notes: true
