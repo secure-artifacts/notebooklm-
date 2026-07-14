@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NotebookLM 转录登记</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { background: #f5f6fb; color: #25283a; font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; width: 340px; }
+      header { align-items: center; background: linear-gradient(135deg, #f0efff, #eef7ff); border-bottom: 1px solid #e1e4ee; display: flex; gap: 11px; padding: 15px 17px; }
+      header img { height: 42px; width: 42px; }
+      header div { display: flex; flex-direction: column; }
+      h1 { font-size: 16px; line-height: 21px; margin: 0; }
+      header span { color: #7e8598; font-size: 10px; line-height: 15px; }
+      main { padding: 15px 17px 17px; }
+      label { color: #555d72; display: block; font-size: 11px; font-weight: 750; margin: 12px 0 6px; }
+      label:first-child { margin-top: 0; }
+      input { background: #fff; border: 1px solid #dce0ea; border-radius: 9px; color: #303549; font: 11px/1.4 Consolas, "Microsoft YaHei", monospace; outline: none; padding: 10px; transition: border-color .15s, box-shadow .15s; width: 100%; }
+      input:focus { border-color: #6869df; box-shadow: 0 0 0 3px rgba(104,105,223,.12); }
+      button { background: linear-gradient(135deg, #6262e8, #4c50ce); border: 0; border-radius: 9px; box-shadow: 0 5px 14px rgba(78,80,196,.2); color: #fff; cursor: pointer; font: 700 12px/1 "Segoe UI", "Microsoft YaHei", sans-serif; margin-top: 15px; min-height: 40px; width: 100%; }
+      #status { color: #397d70; font-size: 11px; line-height: 17px; margin: 9px 0 0; min-height: 17px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <img src="../assets/icon.svg" alt="">
+      <div><h1>NotebookLM 转录登记</h1><span>自动提取、翻译与表格写入</span></div>
+    </header>
+    <main>
+      <label for="deploymentUrl">Apps Script 部署链接</label>
+      <input id="deploymentUrl" type="url" placeholder="https://script.google.com/macros/s/.../exec">
+      <button type="button" id="saveSettings">保存设置</button>
+      <p id="status" role="status"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
