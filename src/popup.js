@@ -4,6 +4,10 @@ const status = document.getElementById("status");
 
 loadSettings();
 
+document.getElementById("openNotebook").addEventListener("click", () => {
+  chrome.tabs.create({ url: "https://notebooklm.google.com/" });
+});
+
 document.getElementById("saveSettings").addEventListener("click", async () => {
   const deploymentUrl = deploymentInput.value.trim();
   if (!isDeploymentUrl(deploymentUrl)) return showStatus("请输入有效的 Apps Script /exec 部署链接。", true);

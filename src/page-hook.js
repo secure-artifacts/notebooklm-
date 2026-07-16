@@ -2,11 +2,15 @@
   "use strict";
 
   const APP_ID = "nlm-video-translation-helper";
+  const BRIDGE_TOKEN = document.currentScript && document.currentScript.dataset
+    ? String(document.currentScript.dataset.bridgeToken || "")
+    : "";
   const MAX_BODY_CHARS = 1200;
   const RPC = {
     createSource: "o4cbdc",
     pollNotebook: "rLM1Ne",
-    getTranscript: "hizoJc"
+    getTranscript: "hizoJc",
+    deleteSource: "tGMBJ"
   };
 
   if (window.__nlmVideoTranslationHelperHooked) {
@@ -130,12 +134,12 @@
   }
 
   async function handleApiRequest(event) {
-    if (event.source !== window || !event.data || event.data.source !== APP_ID || event.data.target !== "page") {
+    if (event.source !== window || !event.data || event.data.source !== APP_ID || event.data.target !== "page" || event.data.token !== BRIDGE_TOKEN || !BRIDGE_TOKEN) {
       return;
     }
 
     const { requestId, action, payload } = event.data;
-    if (event.data.type !== "api-request" || !["transcribe-single", "extract-existing-sources"].includes(action)) {
+    if (event.data.type !== "api-request" || !["transcribe-single", "upload-media-source", "extract-existing-sources", "delete-sources"].includes(action)) {
       return;
     }
 
@@ -151,14 +155,20 @@
     try {
       const client = new NotebookLmApiClient(progress);
       let result;
-      if (action === "transcribe-single") {
+      if (action === "transcribe-single" || action === "upload-media-source") {
         const file = payload && payload.file;
         if (!isFileLike(file)) {
           throw new Error("No media file was provided to the page API client.");
         }
-        result = await client.transcribeSingleFile(file, payload.options || {});
+        result = await client.transcribeSingleFile(file, {
+          ...(payload.options || {}),
+          requireTranscript: action === "transcribe-single",
+          waitForProcessing: action === "transcribe-single"
+        });
+      } else if (action === "extract-existing-sources") {
+        result = await client.extractExistingSources(payload || {});
       } else {
-        result = await client.extractExistingSources();
+        result = await client.deleteSources(payload || {});
       }
       sendToContent("api-response", requestId, {
         ok: true,
@@ -184,6 +194,8 @@
       const fileName = file.name || "notebooklm-media";
       const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 15 * 60 * 1000;
       const pollIntervalMs = Number.isFinite(options.pollIntervalMs) ? options.pollIntervalMs : 3000;
+      const requireTranscript = options.requireTranscript !== false;
+      const waitForProcessing = options.waitForProcessing !== false;
 
       this.progress("Creating NotebookLM source...", {
         lastRpc: RPC.createSource,
@@ -205,26 +217,51 @@
       });
       await this.uploadBytes(uploadUrl, file);
 
+      if (!waitForProcessing) {
+        return {
+          sourceId,
+          fileName,
+          transcript: "",
+          uploaded: true,
+          runtime: {
+            projectId: this.params.projectId,
+            bl: this.params.bl,
+            hl: this.params.hl
+          }
+        };
+      }
+
       this.progress("Waiting for NotebookLM processing...", {
         sourceId,
         lastRpc: RPC.pollNotebook,
         pollCount: 0
       });
-      const pollInfo = await this.waitForSourceReady(sourceId, timeoutMs, pollIntervalMs);
+      const pollInfo = await this.waitForSourceReady(sourceId, timeoutMs, pollIntervalMs, fileName);
 
       this.progress("Fetching source transcript...", {
         sourceId,
         pollCount: pollInfo.pollCount,
         lastRpc: RPC.getTranscript
       });
-      const transcriptPayload = await this.getSourceDetail(sourceId);
-      const transcript = extractTranscriptText(transcriptPayload, {
-        sourceId,
-        projectId: this.params.projectId,
-        fileName
-      });
+      let transcriptPayload = null;
+      let transcript = "";
+      try {
+        transcriptPayload = await this.getSourceDetail(sourceId);
+        transcript = extractTranscriptText(transcriptPayload, {
+          sourceId,
+          projectId: this.params.projectId,
+          fileName
+        });
+      } catch (error) {
+        if (requireTranscript) throw error;
+        sendLog("api", "warn", "Source upload succeeded but transcript lookup failed.", {
+          sourceId,
+          fileName,
+          error: serialize(error)
+        });
+      }
 
-      if (!transcript) {
+      if (!transcript && requireTranscript) {
         const error = new Error("NotebookLM returned source details but no transcript text was found.");
         error.debug = summarizePayload(transcriptPayload);
         throw error;
@@ -244,14 +281,34 @@
       };
     }
 
-    async extractExistingSources() {
+    async extractExistingSources(options = {}) {
       this.progress("正在读取笔记本来源列表…", {
         lastRpc: RPC.pollNotebook
       });
       const notebookPayload = await this.getNotebookState();
-      const sources = extractSourceRecords(notebookPayload, this.params.projectId);
+      const allSources = extractSourceRecords(notebookPayload, this.params.projectId);
+      const requestedIds = new Set(Array.isArray(options.sourceIds) ? options.sourceIds.filter(Boolean) : []);
+      const skippedIds = new Set(Array.isArray(options.skipSourceIds) ? options.skipSourceIds.filter(Boolean) : []);
+      const sourceNames = options.sourceNames && typeof options.sourceNames === "object" ? options.sourceNames : {};
+      const waitForReady = options.waitForReady === true;
+      const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 15 * 60 * 1000;
+      const pollIntervalMs = Number.isFinite(options.pollIntervalMs) ? options.pollIntervalMs : 3000;
+      let sources = allSources.filter((source) => !skippedIds.has(source.sourceId));
+
+      if (requestedIds.size) {
+        const existingById = new Map(allSources.map((source) => [source.sourceId, source]));
+        sources = Array.from(requestedIds).map((sourceId, index) => existingById.get(sourceId) || {
+          sourceId,
+          sourceName: sourceNames[sourceId] || `新增来源 ${index + 1}`
+        });
+      }
       if (!sources.length) {
-        throw new Error("Could not identify any existing sources in the NotebookLM response.");
+        return {
+          records: [],
+          totalSources: allSources.length,
+          skipped: allSources.filter((source) => skippedIds.has(source.sourceId)).length,
+          lastRpc: RPC.getTranscript
+        };
       }
 
       const records = [];
@@ -265,6 +322,12 @@
         });
 
         try {
+          if (waitForReady) {
+            await this.waitForSourceReady(source.sourceId, timeoutMs, pollIntervalMs, sourceName);
+          } else {
+            const visibleFailure = findVisibleSourceFailure(sourceName);
+            if (visibleFailure) throw createSourceProcessingError(visibleFailure);
+          }
           const transcriptPayload = await this.getSourceDetail(source.sourceId);
           const transcript = extractTranscriptText(transcriptPayload, {
             sourceId: source.sourceId,
@@ -290,7 +353,55 @@
         }
       }
 
-      return { records, lastRpc: RPC.getTranscript };
+      return {
+        records,
+        totalSources: allSources.length,
+        skipped: allSources.filter((source) => skippedIds.has(source.sourceId)).length,
+        lastRpc: RPC.getTranscript
+      };
+    }
+
+    async deleteSources(options = {}) {
+      this.progress("正在读取待移除来源…", {
+        lastRpc: RPC.pollNotebook
+      });
+      const notebookPayload = await this.getNotebookState();
+      const allSources = extractSourceRecords(notebookPayload, this.params.projectId);
+      const sourceById = new Map(allSources.map((source) => [source.sourceId, source]));
+      const requestedIds = Array.isArray(options.sourceIds)
+        ? Array.from(new Set(options.sourceIds.filter(Boolean)))
+        : [];
+      const targets = requestedIds.length
+        ? requestedIds.map((sourceId) => sourceById.get(sourceId) || { sourceId, sourceName: sourceId })
+        : allSources;
+      const deleted = [];
+      const failed = [];
+
+      for (let index = 0; index < targets.length; index += 1) {
+        const source = targets[index];
+        this.progress(`正在移除 ${index + 1}/${targets.length}：${source.sourceName || source.sourceId}`, {
+          sourceId: source.sourceId,
+          sourceName: source.sourceName,
+          lastRpc: RPC.deleteSource
+        });
+        try {
+          await this.batchexecute(RPC.deleteSource, [[[source.sourceId]], [2]]);
+          deleted.push(source.sourceId);
+        } catch (error) {
+          failed.push({
+            sourceId: source.sourceId,
+            sourceName: source.sourceName,
+            error: error && error.message ? error.message : String(error)
+          });
+        }
+      }
+
+      return {
+        requested: targets.length,
+        deleted,
+        failed,
+        lastRpc: RPC.deleteSource
+      };
     }
 
     async createSource(fileName) {
@@ -321,14 +432,15 @@
         fileName,
         sourceId
       });
-      const response = await fetchImpl("/upload/_/?authuser=0", {
+      const response = await fetchImpl(`/upload/_/?authuser=${encodeURIComponent(this.params.authuser)}`, {
         method: "POST",
         credentials: "include",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-          "X-Goog-AuthUser": "0",
+          "X-Goog-AuthUser": this.params.authuser,
           "X-Goog-Upload-Command": "start",
           "X-Goog-Upload-Header-Content-Length": String(file.size),
+          "X-Goog-Upload-Header-Content-Type": file.type || "application/octet-stream",
           "X-Goog-Upload-Protocol": "resumable"
         },
         body: JSON.stringify({
@@ -370,8 +482,8 @@
         method: "POST",
         credentials: "include",
         headers: {
-          "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
-          "X-Goog-AuthUser": "0",
+          "Content-Type": file.type || "application/octet-stream",
+          "X-Goog-AuthUser": this.params.authuser,
           "X-Goog-Upload-Command": "upload, finalize",
           "X-Goog-Upload-Offset": "0"
         },
@@ -395,17 +507,32 @@
       }
     }
 
-    async waitForSourceReady(sourceId, timeoutMs, pollIntervalMs) {
+    async waitForSourceReady(sourceId, timeoutMs, pollIntervalMs, sourceName = "") {
       const started = Date.now();
       let pollCount = 0;
       let lastSource = null;
+      let sourceWasVisible = false;
+      let missingAfterVisible = 0;
 
       while (Date.now() - started < timeoutMs) {
         pollCount += 1;
+        const visibleFailure = findVisibleSourceFailure(sourceName);
+        if (visibleFailure) {
+          const error = createSourceProcessingError(visibleFailure);
+          error.debug = { sourceId, sourceName, pollCount, detection: "visible-error-container" };
+          throw error;
+        }
+
         const payload = await this.getNotebookState();
         const source = findSourceEntry(payload, sourceId);
         lastSource = source || lastSource;
         const status = source ? summarizeSourceStatus(source) : null;
+        if (source) {
+          sourceWasVisible = true;
+          missingAfterVisible = 0;
+        } else if (sourceWasVisible) {
+          missingAfterVisible += 1;
+        }
 
         this.progress(`Waiting for processing (${pollCount})...`, {
           sourceId,
@@ -414,14 +541,29 @@
           detail: status
         });
 
+        if (status && status.failed) {
+          const error = createSourceProcessingError({
+            sourceName: sourceName || sourceId,
+            message: "NotebookLM 返回来源处理失败状态。"
+          });
+          error.debug = { sourceId, sourceName, pollCount, detection: "source-status-code", status };
+          throw error;
+        }
         if (status && status.ready) {
           return { pollCount, source, status };
+        }
+        if (missingAfterVisible >= 3) {
+          const error = new Error("NotebookLM 来源在处理过程中消失，已停止等待。");
+          error.code = "SOURCE_DISAPPEARED";
+          error.debug = { sourceId, sourceName, pollCount, lastSource: summarizePayload(lastSource) };
+          throw error;
         }
 
         await wait(pollIntervalMs);
       }
 
-      const error = new Error("Timed out waiting for NotebookLM to process the source.");
+      const error = new Error(`NotebookLM 处理来源超时（等待 ${Math.ceil(timeoutMs / 60000)} 分钟）。`);
+      error.code = "SOURCE_PROCESSING_TIMEOUT";
       error.debug = {
         sourceId,
         pollCount,
@@ -528,6 +670,9 @@
     const fsid = extractQueryParamFromRuntimeText(runtimeText, "f.sid") ||
       firstMatch(runtimeText, /f\.sid[=:"'\s]+(-?\d{8,})/) ||
       firstMatch(runtimeText, /"f\.sid","(-?\d{8,})"/);
+    const authuserCandidate = new URLSearchParams(window.location.search).get("authuser") ||
+      extractQueryParamFromRuntimeText(runtimeText, "authuser") || "0";
+    const authuser = /^\d+$/.test(authuserCandidate) ? authuserCandidate : "0";
     const hl = (document.documentElement.lang || navigator.language || "en-GB").replace("_", "-");
 
     const missing = [];
@@ -544,6 +689,7 @@
       at,
       bl,
       fsid,
+      authuser,
       hl,
       sourcePath: `/notebook/${projectId}`
     };
@@ -736,22 +882,62 @@
     return scoreSourceName(value) >= 30;
   }
 
+  function findVisibleSourceFailure(sourceName) {
+    const failedContainers = Array.from(document.querySelectorAll(".single-source-container.single-source-error-container"));
+    if (!failedContainers.length) return null;
+    const expectedName = String(sourceName || "").trim();
+    const container = failedContainers.find((item) => {
+      const sourceButton = item.querySelector("button.source-stretched-button");
+      const visibleName = sourceButton
+        ? String(sourceButton.getAttribute("aria-label") || "").trim()
+        : String((item.querySelector(".source-title") || {}).textContent || "").trim();
+      return expectedName ? visibleName === expectedName : failedContainers.length === 1;
+    });
+    if (!container) return null;
+    const sourceButton = container.querySelector("button.source-stretched-button");
+    const visibleName = sourceButton
+      ? String(sourceButton.getAttribute("aria-label") || expectedName).trim()
+      : expectedName;
+    return {
+      sourceName: visibleName || expectedName || "未命名来源",
+      message: "NotebookLM 已将该来源标记为处理失败，可能是媒体编码、文件损坏或服务处理异常。"
+    };
+  }
+
+  function createSourceProcessingError(failure) {
+    const error = new Error(`${failure.sourceName}：${failure.message}`);
+    error.code = "SOURCE_PROCESSING_FAILED";
+    return error;
+  }
+
   function summarizeSourceStatus(source) {
     const text = JSON.stringify(source);
     const mime = firstMatch(text, /(?:video|audio)\/[a-zA-Z0-9.+-]+/);
     const uuidCount = (text.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) || []).length;
-    const stateCodes = collectTupleCodes(source, null);
+    const stateCode = directSourceStateCode(source);
     const metaCodes = collectTupleCodes(source, 1);
-    const stateCode = stateCodes.includes(2) ? 2 : stateCodes[0] ?? null;
+    const failed = stateCode === 3;
     const metaCode = metaCodes.includes(1) ? 1 : metaCodes[0] ?? null;
-    const ready = stateCode === 2 || Boolean(mime && uuidCount > 1 && metaCode === 1);
+    const ready = stateCode === 2 || (stateCode === null && Boolean(mime && uuidCount > 1 && metaCode === 1));
     return {
       ready,
+      failed,
       stateCode,
       metaCode,
       mime: mime || null,
       hasBlobId: uuidCount > 1
     };
+  }
+
+  function directSourceStateCode(source) {
+    if (!Array.isArray(source)) return null;
+    for (let index = source.length - 1; index >= 0; index -= 1) {
+      const item = source[index];
+      if (Array.isArray(item) && item[0] === null && typeof item[1] === "number" && [1, 2, 3, 5].includes(item[1])) {
+        return item[1];
+      }
+    }
+    return null;
   }
 
   function findArrayContainingText(node, needle) {
@@ -873,6 +1059,7 @@
       source: APP_ID,
       target: "content",
       type,
+      token: BRIDGE_TOKEN,
       requestId,
       payload
     }, window.location.origin);
@@ -881,7 +1068,9 @@
   function sendLog(scope, level, detail, explicitDetail) {
     window.postMessage({
       source: APP_ID,
+      target: "content",
       type: "page-log",
+      token: BRIDGE_TOKEN,
       payload: {
         scope,
         level,

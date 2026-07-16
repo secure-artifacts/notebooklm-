@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "NotebookLM 转录登记",
-  "version": "0.7.0",
-  "description": "提取 NotebookLM 来源转录、可选翻译，并登记到 Google 表格后端。",
+  "version": "0.9.4",
+  "description": "批量导入公开 Drive 音视频，提取与清理 NotebookLM 来源、可选翻译，并登记到 Google 表格后端。",
   "permissions": [
     "storage"
   ],
@@ -11,6 +11,7 @@
   },
   "host_permissions": [
     "https://notebooklm.google.com/*",
+    "https://drive.usercontent.google.com/*",
     "https://translate.googleapis.com/*",
     "https://script.google.com/*",
     "https://script.googleusercontent.com/*"
@@ -49,6 +50,8 @@
     {
       "resources": [
         "src/page-hook.js",
+        "src/drive-loader.html",
+        "src/drive-loader.js",
         "assets/icon-128.png"
       ],
       "matches": [
