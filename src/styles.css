@@ -169,6 +169,38 @@
 .nlm-drive-import-body textarea:disabled { background: #f1f2f6; cursor: wait; opacity: .7; }
 .nlm-drive-import-body > div { align-items: center; display: flex; gap: 8px; justify-content: space-between; margin-top: 8px; }
 .nlm-drive-import-body > div small { color: #858c9e; font-size: 9px; line-height: 13px; }
+.nlm-drive-import-actions > small { flex: 1 1 auto; min-width: 0; }
+.nlm-batch-size {
+  align-items: center;
+  background: #fff;
+  border: 1px solid #dfe2eb;
+  border-radius: 8px;
+  color: #687085;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 9px;
+  font-weight: 700;
+  gap: 4px;
+  min-height: 30px;
+  padding: 0 6px 0 8px;
+}
+.nlm-batch-size input {
+  appearance: textfield;
+  background: #f5f6fa;
+  border: 0;
+  border-radius: 5px;
+  color: #394057;
+  font: 750 10px/1 "Segoe UI", "Microsoft YaHei", sans-serif;
+  height: 21px;
+  outline: none;
+  padding: 0 3px;
+  text-align: center;
+  width: 40px;
+}
+.nlm-batch-size input::-webkit-inner-spin-button,
+.nlm-batch-size input::-webkit-outer-spin-button { margin: 0; opacity: .55; }
+.nlm-batch-size input:focus { background: #eef0ff; box-shadow: 0 0 0 2px rgba(106,107,224,.12); }
+.nlm-batch-size:has(input:disabled) { cursor: wait; opacity: .58; }
 .nlm-drive-import-body button {
   background: linear-gradient(135deg, #348d7b, #277366);
   border: 0;
@@ -414,6 +446,8 @@
 .nlm-result-error { background: #fff5f5; border-radius: 7px; color: #b24752; font-size: 10px; line-height: 1.6; padding: 8px 9px; }
 
 @container (max-width: 560px) {
+  .nlm-drive-import-actions { flex-wrap: wrap; }
+  .nlm-drive-import-actions > small { flex-basis: 100%; }
   .nlm-result-grid.has-translation { grid-template-columns: minmax(0, 1fr); }
   .nlm-result-grid.has-translation .nlm-result-content + .nlm-result-content { border-left: 0; border-top: 1px solid #e8eaf1; }
 }

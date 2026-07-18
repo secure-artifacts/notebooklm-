@@ -6,6 +6,8 @@
     ? String(document.currentScript.dataset.bridgeToken || "")
     : "";
   const MAX_BODY_CHARS = 1200;
+  const UPLOAD_MAX_ATTEMPTS = 3;
+  const UPLOAD_RETRY_BASE_DELAY_MS = 1200;
   const RPC = {
     createSource: "o4cbdc",
     pollNotebook: "rLM1Ne",
@@ -207,15 +209,7 @@
         lastRpc: RPC.createSource
       });
 
-      this.progress("Starting resumable upload...", {
-        sourceId
-      });
-      const uploadUrl = await this.startUpload(file, fileName, sourceId);
-
-      this.progress("Uploading file bytes...", {
-        sourceId
-      });
-      await this.uploadBytes(uploadUrl, file);
+      await this.uploadSourceBytesWithRetry(file, fileName, sourceId);
 
       if (!waitForProcessing) {
         return {
@@ -281,6 +275,42 @@
       };
     }
 
+    async uploadSourceBytesWithRetry(file, fileName, sourceId) {
+      let lastError;
+      for (let attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt += 1) {
+        try {
+          this.progress(`Starting resumable upload (${attempt}/${UPLOAD_MAX_ATTEMPTS})...`, {
+            sourceId,
+            detail: { fileName, attempt }
+          });
+          const uploadUrl = await this.startUpload(file, fileName, sourceId);
+          this.progress(`Uploading file bytes (${attempt}/${UPLOAD_MAX_ATTEMPTS})...`, {
+            sourceId,
+            detail: { fileName, attempt }
+          });
+          await this.uploadBytes(uploadUrl, file);
+          return;
+        } catch (error) {
+          lastError = error;
+          if (attempt >= UPLOAD_MAX_ATTEMPTS || !isRetryableUploadError(error)) throw error;
+          const delayMs = UPLOAD_RETRY_BASE_DELAY_MS * attempt;
+          sendLog("api", "warn", "Upload attempt failed; retrying with the same source ID.", {
+            sourceId,
+            fileName,
+            attempt,
+            delayMs,
+            error: serialize(error)
+          });
+          this.progress(`上传临时失败，${Math.ceil(delayMs / 1000)} 秒后重试（${attempt + 1}/${UPLOAD_MAX_ATTEMPTS}）…`, {
+            sourceId,
+            detail: { fileName, attempt, delayMs }
+          });
+          await wait(delayMs);
+        }
+      }
+      throw lastError || new Error("Upload failed.");
+    }
+
     async extractExistingSources(options = {}) {
       this.progress("正在读取笔记本来源列表…", {
         lastRpc: RPC.pollNotebook
@@ -292,7 +322,9 @@
       const sourceNames = options.sourceNames && typeof options.sourceNames === "object" ? options.sourceNames : {};
       const waitForReady = options.waitForReady === true;
       const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 15 * 60 * 1000;
+      const overallTimeoutMs = Number.isFinite(options.overallTimeoutMs) ? options.overallTimeoutMs : timeoutMs;
       const pollIntervalMs = Number.isFinite(options.pollIntervalMs) ? options.pollIntervalMs : 3000;
+      const deadline = waitForReady ? Date.now() + overallTimeoutMs : Number.POSITIVE_INFINITY;
       let sources = allSources.filter((source) => !skippedIds.has(source.sourceId));
 
       if (requestedIds.size) {
@@ -323,7 +355,18 @@
 
         try {
           if (waitForReady) {
-            await this.waitForSourceReady(source.sourceId, timeoutMs, pollIntervalMs, sourceName);
+            const remainingMs = deadline - Date.now();
+            if (remainingMs <= 0) {
+              const timeoutError = new Error(`本批来源处理已达到 ${Math.ceil(overallTimeoutMs / 60000)} 分钟上限。`);
+              timeoutError.code = "BATCH_PROCESSING_TIMEOUT";
+              throw timeoutError;
+            }
+            await this.waitForSourceReady(
+              source.sourceId,
+              Math.min(timeoutMs, remainingMs),
+              pollIntervalMs,
+              sourceName
+            );
           } else {
             const visibleFailure = findVisibleSourceFailure(sourceName);
             if (visibleFailure) throw createSourceProcessingError(visibleFailure);
@@ -1039,6 +1082,13 @@
       previous = item;
     }
     return output;
+  }
+
+  function isRetryableUploadError(error) {
+    const status = Number(error && error.debug && error.debug.status) || 0;
+    if (status) return status === 408 || status === 425 || status === 429 || status >= 500;
+    const message = String(error && error.message ? error.message : error || "");
+    return /failed to fetch|network|connection|timeout|temporar/i.test(message);
   }
 
   function wait(ms) {

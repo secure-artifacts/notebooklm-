@@ -6,8 +6,17 @@
   const SHEET_SETTINGS_KEY = "nlmSheetApiSettings";
   const API_TIMEOUT_MS = 10 * 60 * 1000;
   const MEDIA_UPLOAD_TIMEOUT_MS = 30 * 60 * 1000;
+  const BATCH_EXTRACTION_TIMEOUT_MS = 30 * 60 * 1000;
+  const PAGE_RESPONSE_GRACE_MS = 15 * 1000;
   const DRIVE_DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
-  const MAX_LOGS = 120;
+  const DEFAULT_DRIVE_BATCH_SIZE = 10;
+  const MIN_DRIVE_BATCH_SIZE = 1;
+  const MAX_DRIVE_BATCH_SIZE = 25;
+  const DRIVE_PIPELINE_CONCURRENCY = 3;
+  const DRIVE_DOWNLOAD_MAX_ATTEMPTS = 3;
+  const DRIVE_RETRY_BASE_DELAY_MS = 1000;
+  const SHEET_REGISTRATION_BATCH_SIZE = 200;
+  const MAX_LOGS = 240;
   const EXTENSION_ORIGIN = `chrome-extension://${chrome.runtime.id}`;
   const PAGE_BRIDGE_TOKEN = typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
@@ -21,6 +30,7 @@
     isBusy: false,
     translateEnabled: false,
     autoDeleteImported: true,
+    driveBatchSize: DEFAULT_DRIVE_BATCH_SIZE,
     databaseUrl: "",
     minimized: false,
     bottomOpen: true,
@@ -34,6 +44,7 @@
   };
   const pendingRequests = new Map();
   const pendingDriveDownloads = new Map();
+  const activeDriveUploads = new Map();
   let driveLoaderFrame = null;
   let driveLoaderReady = null;
   let initialized = false;
@@ -62,6 +73,7 @@
     const sheetSettings = saved[SHEET_SETTINGS_KEY] || {};
     state.translateEnabled = Boolean(panelSettings.translateEnabled);
     state.autoDeleteImported = panelSettings.autoDeleteImported !== false;
+    state.driveBatchSize = normalizeDriveBatchSize(panelSettings.driveBatchSize);
     state.databaseUrl = String(sheetSettings.databaseUrl || "");
     state.minimized = Boolean(panelSettings.minimized);
     state.panelLayout = panelSettings.layout || null;
@@ -105,6 +117,7 @@
       pending.reject(new Error("已切换笔记本，当前下载已取消。"));
     });
     pendingDriveDownloads.clear();
+    activeDriveUploads.clear();
     if (driveLoaderFrame) driveLoaderFrame.remove();
     driveLoaderFrame = null;
     driveLoaderReady = null;
@@ -151,16 +164,13 @@
             <summary><span><b>Google Drive 音视频导入</b><small>公开链接 · 无需授权</small></span></summary>
             <div class="nlm-drive-import-body">
               <textarea data-role="drive-urls" rows="3" spellcheck="false" placeholder="每行粘贴一个公开的 Google Drive 文件链接"></textarea>
-              <div><small>仅接受公开音视频；上传当前文件时预下载下一项。</small><button type="button" data-action="import-drive">开始导入</button></div>
+              <div class="nlm-drive-import-actions">
+                <small>每批上传后立即提取；开启自动移除时释放名额。</small>
+                <label class="nlm-batch-size"><span>每批</span><input type="number" data-role="drive-batch-size" min="1" max="25" step="1" inputmode="numeric"><span>个</span></label>
+                <button type="button" data-action="import-drive">开始导入</button>
+              </div>
             </div>
           </details>
-          <div class="nlm-cleanup-row">
-            <label class="nlm-auto-delete-toggle">
-              <input type="checkbox" data-role="auto-delete-toggle">
-              <span><b>自动移除导入来源</b><small>成功取得转录后释放来源名额</small></span>
-            </label>
-            <button type="button" data-action="delete-all-sources">清空左侧来源</button>
-          </div>
           <div class="nlm-count-card">
             <div class="nlm-count-stat is-total"><b data-role="record-count">0</b><span>总计</span></div>
             <div class="nlm-count-stat is-success"><b data-role="success-count">0</b><span>成功</span></div>
@@ -170,6 +180,13 @@
           <div class="nlm-register-actions">
             <button type="button" data-action="extract"><span>提取转录</span><small>只读取新来源</small></button>
             <button type="button" data-action="register"><span>登记表格</span><small>写入 Google Sheets</small></button>
+          </div>
+          <div class="nlm-cleanup-row">
+            <label class="nlm-auto-delete-toggle">
+              <input type="checkbox" data-role="auto-delete-toggle">
+              <span><b>自动移除导入来源</b><small>成功取得转录后释放来源名额</small></span>
+            </label>
+            <button type="button" data-action="delete-all-sources">清空左侧来源</button>
           </div>
           <div class="nlm-copy-row">
             <button type="button" data-action="copy">复制三列表格</button>
@@ -222,6 +239,12 @@
       render();
       await savePanelSettings();
     });
+    state.root.querySelector("[data-role='drive-batch-size']").addEventListener("change", async (event) => {
+      state.driveBatchSize = normalizeDriveBatchSize(event.target.value);
+      event.target.value = String(state.driveBatchSize);
+      setStage(`Drive 每批处理 ${state.driveBatchSize} 个文件`);
+      await savePanelSettings();
+    });
     state.root.addEventListener("click", (event) => {
       const button = event.target.closest("button[data-action]");
       if (!button) return;
@@ -260,6 +283,9 @@
     if (type === "page-log") return;
     if (target !== "content") return;
     if (type === "api-progress") {
+      if (payload && /上传临时失败/.test(String(payload.stage || ""))) {
+        addLog(payload.stage, "自动重试");
+      }
       if (payload && payload.stage && !state.driveActivity.upload) setStage(payload.stage);
       return;
     }
@@ -282,14 +308,16 @@
     if (type === "drive-download-progress") {
       const received = Number(payload && payload.receivedBytes) || 0;
       const total = Number(payload && payload.totalBytes) || 0;
-      updateDriveActivity("download", `下载 ${pending.position} ${formatBytes(received)}${total ? `/${formatBytes(total)}` : ""}`);
+      pending.receivedBytes = received;
+      pending.totalBytes = total;
+      refreshDriveActivity();
       return;
     }
     if (type !== "drive-download-response") return;
 
     pendingDriveDownloads.delete(requestId);
     clearTimeout(pending.timeoutId);
-    updateDriveActivity("download", "");
+    refreshDriveActivity();
     if (payload && payload.ok && payload.file instanceof File) {
       pending.resolve(payload.file);
     } else {
@@ -305,11 +333,20 @@
       return;
     }
 
+    const batchInput = state.root.querySelector("[data-role='drive-batch-size']");
+    state.driveBatchSize = normalizeDriveBatchSize(batchInput && batchInput.value);
+    if (batchInput) batchInput.value = String(state.driveBatchSize);
+    await savePanelSettings();
+
     state.isBusy = true;
     state.logs = [];
     state.bottomOpen = true;
     state.bottomView = "logs";
-    addLog(`准备流水线导入 ${urls.length} 个公开 Drive 文件：单路上传，同时预下载下一项。`, "导入");
+    const totalBatches = Math.ceil(urls.length / state.driveBatchSize);
+    addLog(`准备导入 ${urls.length} 个公开 Drive 文件：共 ${totalBatches} 批，每批最多 ${state.driveBatchSize} 个。`, "导入");
+    if (!state.autoDeleteImported && totalBatches > 1) {
+      addLog("自动移除已关闭；多批次来源会持续占用当前笔记本名额，达到上限后后续上传可能失败。", "提醒");
+    }
     render();
 
     let succeeded = 0;
@@ -317,109 +354,52 @@
     let processingFailed = 0;
     let transcriptsAdded = 0;
     let autoDeleted = 0;
-    const uploadedSources = [];
-    const extractedSourceIds = [];
 
     try {
       await ensureDriveLoader();
-      let downloadTask = startDriveDownload(urls[0], 0, urls.length);
-      for (let index = 0; index < urls.length; index += 1) {
-        const position = `${index + 1}/${urls.length}`;
-        const downloaded = await downloadTask;
-        downloadTask = index + 1 < urls.length
-          ? startDriveDownload(urls[index + 1], index + 1, urls.length)
-          : null;
+      for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
+        const batchStart = batchIndex * state.driveBatchSize;
+        const batchUrls = urls.slice(batchStart, batchStart + state.driveBatchSize);
+        const batchLabel = `${batchIndex + 1}/${totalBatches}`;
+        setStage(`正在处理批次 ${batchLabel}（${batchUrls.length} 个文件）…`);
+        addLog(`批次 ${batchLabel} 开始：${batchUrls.length} 个文件。`, "批次");
 
-        if (!downloaded.ok) {
-          failed += 1;
-          addLog(`${position} ${downloaded.error.message || String(downloaded.error)}`, "下载失败");
-          render();
-          continue;
+        const uploadSummary = await uploadDriveBatch(batchUrls, batchStart, urls.length);
+        succeeded += uploadSummary.succeeded;
+        failed += uploadSummary.failed;
+
+        const extractionSummary = await extractDriveBatch(uploadSummary.uploadedSources, batchLabel);
+        transcriptsAdded += extractionSummary.transcriptsAdded;
+        processingFailed += extractionSummary.processingFailed;
+
+        let batchDeleted = 0;
+        if (state.autoDeleteImported && extractionSummary.extractedSourceIds.length) {
+          batchDeleted = await deleteImportedBatch(extractionSummary.extractedSourceIds, batchLabel);
+          autoDeleted += batchDeleted;
         }
 
-        const file = downloaded.file;
-        try {
-          const mediaKind = file.type.startsWith("video/") ? "视频" : "音频";
-          addLog(`${position} 已识别${mediaKind}：${file.name}（${file.type}，${formatBytes(file.size)}）`, "下载");
-
-          updateDriveActivity("upload", `上传 ${position} ${file.name}`);
-          const result = await callPageApi("upload-media-source", {
-            file,
-            options: { timeoutMs: MEDIA_UPLOAD_TIMEOUT_MS, pollIntervalMs: 3000 }
-          }, MEDIA_UPLOAD_TIMEOUT_MS);
-
-          succeeded += 1;
-          addLog(`${position} 已加入 NotebookLM：${file.name}`, "成功");
-          if (result && result.sourceId) {
-            uploadedSources.push({ sourceId: result.sourceId, fileName: result.fileName || file.name });
-          }
-        } catch (error) {
-          failed += 1;
-          addLog(`${position} ${error.message || String(error)}`, "上传失败");
-        } finally {
-          updateDriveActivity("upload", "");
+        const retainedSources = Math.max(0, uploadSummary.uploadedSources.length - batchDeleted);
+        if (state.autoDeleteImported && retainedSources) {
+          addLog(
+            `批次 ${batchLabel} 仍保留 ${retainedSources} 个来源（转录或自动移除未成功），会继续占用 NotebookLM 来源名额。`,
+            "提醒"
+          );
         }
+
+        addLog(
+          `批次 ${batchLabel} 完成：上传成功 ${uploadSummary.succeeded}，上传失败 ${uploadSummary.failed}，` +
+          `转录成功 ${extractionSummary.transcriptsAdded}，转录失败 ${extractionSummary.processingFailed}，自动移除 ${batchDeleted}。`,
+          "批次汇总"
+        );
         render();
       }
 
-      if (uploadedSources.length) {
-        setStage(`已上传 ${uploadedSources.length} 个文件，等待 NotebookLM 生成转录…`);
-        addLog(`上传阶段结束，开始统一等待并提取 ${uploadedSources.length} 个新增来源。`, "提取");
-        try {
-          const sourceNames = Object.fromEntries(uploadedSources.map((item) => [item.sourceId, item.fileName]));
-          const result = await callPageApi("extract-existing-sources", {
-            sourceIds: uploadedSources.map((item) => item.sourceId),
-            sourceNames,
-            waitForReady: true,
-            timeoutMs: MEDIA_UPLOAD_TIMEOUT_MS,
-            pollIntervalMs: 3000
-          }, MEDIA_UPLOAD_TIMEOUT_MS);
-          const returnedRecords = Array.isArray(result.records) ? result.records : [];
-          const returnedIds = new Set(returnedRecords.map((record) => record.sourceId).filter(Boolean));
-          const missingRecords = uploadedSources
-            .filter((item) => item.sourceId && !returnedIds.has(item.sourceId))
-            .map((item) => ({
-              sourceId: item.sourceId,
-              sourceName: item.fileName,
-              transcript: "",
-              error: "NotebookLM 未返回该来源的处理结果。"
-            }));
-          const importedRecords = [...returnedRecords, ...missingRecords];
-          transcriptsAdded = mergeRecords(importedRecords);
-          processingFailed += importedRecords.filter((record) => record.error || !record.transcript).length;
-          extractedSourceIds.push(...importedRecords
-            .filter((record) => record.sourceId && record.transcript && !record.error)
-            .map((record) => record.sourceId));
-          importedRecords.filter((record) => record.error).forEach((record) => {
-            addLog(`${record.sourceName || record.sourceId}：${record.error}`, "转录失败");
-          });
-        } catch (error) {
-          const message = error.message || String(error);
-          const failedRecords = uploadedSources.map((item) => ({
-            sourceId: item.sourceId,
-            sourceName: item.fileName,
-            transcript: "",
-            error: message
-          }));
-          processingFailed += failedRecords.length;
-          mergeRecords(failedRecords);
-          addLog(`文件已上传，但统一提取转录失败：${message}`, "转录失败");
-        }
+      if (state.translateEnabled && transcriptsAdded) {
+        setStage(`全部 ${totalBatches} 个批次已完成，正在翻译转录…`);
+        addLog("所有导入批次已完成并释放可移除来源，开始统一翻译。", "翻译");
+        await translateRecords();
       }
 
-      if (state.translateEnabled && transcriptsAdded) await translateRecords();
-      if (state.autoDeleteImported && extractedSourceIds.length) {
-        setStage(`正在移除 ${extractedSourceIds.length} 个已完成来源…`);
-        try {
-          const deletion = await deleteNotebookSources(extractedSourceIds);
-          autoDeleted = deletion.deleted.length;
-          markSourcesDeleted(deletion.deleted);
-          addLog(`自动移除成功 ${autoDeleted} 个；失败 ${deletion.failed.length} 个。`, "来源清理");
-          deletion.failed.forEach((item) => addLog(`${item.sourceName || item.sourceId}：${item.error}`, "移除失败"));
-        } catch (error) {
-          addLog(`转录已保留，但自动移除失败：${error.message || String(error)}`, "移除失败");
-        }
-      }
       const totalFailed = failed + processingFailed;
       setStage(totalFailed
         ? `导入结束：转录成功 ${transcriptsAdded}，失败 ${totalFailed}`
@@ -431,8 +411,147 @@
     } finally {
       state.driveActivity.download = "";
       state.driveActivity.upload = "";
+      activeDriveUploads.clear();
       state.isBusy = false;
       render();
+    }
+  }
+
+  async function uploadDriveBatch(batchUrls, batchStart, totalUrls) {
+    const startedAt = Date.now();
+    const results = new Array(batchUrls.length);
+    const workerCount = Math.min(DRIVE_PIPELINE_CONCURRENCY, batchUrls.length);
+    let nextIndex = 0;
+
+    async function worker() {
+      while (true) {
+        const localIndex = nextIndex;
+        nextIndex += 1;
+        if (localIndex >= batchUrls.length) return;
+        try {
+          results[localIndex] = await importOneDriveFile(
+            batchUrls[localIndex],
+            batchStart + localIndex,
+            totalUrls
+          );
+        } catch (error) {
+          const position = `${batchStart + localIndex + 1}/${totalUrls}`;
+          addLog(`${position} 未预期错误：${error.message || String(error)}`, "导入失败");
+          results[localIndex] = { ok: false };
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    const uploadedSources = results
+      .filter((result) => result && result.ok && result.sourceId)
+      .map((result) => ({ sourceId: result.sourceId, fileName: result.fileName }));
+    const succeeded = uploadedSources.length;
+    const failed = results.length - succeeded;
+    addLog(
+      `本批下载与上传完成：${workerCount} 路受控并发，成功 ${succeeded}，失败 ${failed}，耗时 ${formatDuration(Date.now() - startedAt)}。`,
+      "上传汇总"
+    );
+    return { uploadedSources, succeeded, failed };
+  }
+
+  async function importOneDriveFile(url, globalIndex, totalUrls) {
+    const position = `${globalIndex + 1}/${totalUrls}`;
+    let file;
+    try {
+      file = await downloadDriveMediaWithRetry(url, position);
+      const mediaKind = file.type.startsWith("video/") ? "视频" : "音频";
+      addLog(`${position} 已识别${mediaKind}：${file.name}（${file.type}，${formatBytes(file.size)}）`, "下载");
+    } catch (error) {
+      addLog(`${position} ${error.message || String(error)}`, "下载失败");
+      return { ok: false };
+    }
+
+    const activityId = `${globalIndex}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    activeDriveUploads.set(activityId, { position, fileName: file.name });
+    refreshDriveActivity();
+    try {
+      const result = await callPageApi("upload-media-source", {
+        file,
+        options: { timeoutMs: MEDIA_UPLOAD_TIMEOUT_MS, pollIntervalMs: 3000 }
+      }, MEDIA_UPLOAD_TIMEOUT_MS);
+      if (!result || !result.sourceId) {
+        throw new Error("NotebookLM 已接收文件，但未返回可用于提取的来源标识。");
+      }
+      addLog(`${position} 已加入 NotebookLM：${file.name}`, "成功");
+      return { ok: true, sourceId: result.sourceId, fileName: result.fileName || file.name };
+    } catch (error) {
+      addLog(`${position} ${error.message || String(error)}`, "上传失败");
+      return { ok: false };
+    } finally {
+      activeDriveUploads.delete(activityId);
+      refreshDriveActivity();
+      render();
+    }
+  }
+
+  async function extractDriveBatch(uploadedSources, batchLabel) {
+    if (!uploadedSources.length) {
+      return { transcriptsAdded: 0, processingFailed: 0, extractedSourceIds: [] };
+    }
+
+    setStage(`批次 ${batchLabel}：等待 ${uploadedSources.length} 个来源生成转录…`);
+    addLog(`批次 ${batchLabel} 上传结束，开始等待并提取 ${uploadedSources.length} 个新增来源。`, "提取");
+    try {
+      const sourceNames = Object.fromEntries(uploadedSources.map((item) => [item.sourceId, item.fileName]));
+      const result = await callPageApi("extract-existing-sources", {
+        sourceIds: uploadedSources.map((item) => item.sourceId),
+        sourceNames,
+        waitForReady: true,
+        timeoutMs: BATCH_EXTRACTION_TIMEOUT_MS - PAGE_RESPONSE_GRACE_MS,
+        overallTimeoutMs: BATCH_EXTRACTION_TIMEOUT_MS - PAGE_RESPONSE_GRACE_MS,
+        pollIntervalMs: 3000
+      }, BATCH_EXTRACTION_TIMEOUT_MS);
+      const returnedRecords = Array.isArray(result.records) ? result.records : [];
+      const returnedIds = new Set(returnedRecords.map((record) => record.sourceId).filter(Boolean));
+      const missingRecords = uploadedSources
+        .filter((item) => item.sourceId && !returnedIds.has(item.sourceId))
+        .map((item) => ({
+          sourceId: item.sourceId,
+          sourceName: item.fileName,
+          transcript: "",
+          error: "NotebookLM 未返回该来源的处理结果。"
+        }));
+      const importedRecords = [...returnedRecords, ...missingRecords];
+      const transcriptsAdded = mergeRecords(importedRecords);
+      const processingFailed = importedRecords.filter((record) => record.error || !record.transcript).length;
+      const extractedSourceIds = importedRecords
+        .filter((record) => record.sourceId && record.transcript && !record.error)
+        .map((record) => record.sourceId);
+      importedRecords.filter((record) => record.error).forEach((record) => {
+        addLog(`${record.sourceName || record.sourceId}：${record.error}`, "转录失败");
+      });
+      return { transcriptsAdded, processingFailed, extractedSourceIds };
+    } catch (error) {
+      const message = error.message || String(error);
+      const failedRecords = uploadedSources.map((item) => ({
+        sourceId: item.sourceId,
+        sourceName: item.fileName,
+        transcript: "",
+        error: message
+      }));
+      mergeRecords(failedRecords);
+      addLog(`批次 ${batchLabel} 文件已上传，但提取转录失败：${message}`, "转录失败");
+      return { transcriptsAdded: 0, processingFailed: failedRecords.length, extractedSourceIds: [] };
+    }
+  }
+
+  async function deleteImportedBatch(sourceIds, batchLabel) {
+    setStage(`批次 ${batchLabel}：正在移除 ${sourceIds.length} 个已完成来源…`);
+    try {
+      const deletion = await deleteNotebookSources(sourceIds);
+      markSourcesDeleted(deletion.deleted);
+      addLog(`批次 ${batchLabel} 自动移除成功 ${deletion.deleted.length} 个；失败 ${deletion.failed.length} 个。`, "来源清理");
+      deletion.failed.forEach((item) => addLog(`${item.sourceName || item.sourceId}：${item.error}`, "移除失败"));
+      return deletion.deleted.length;
+    } catch (error) {
+      addLog(`批次 ${batchLabel} 转录已保留，但自动移除失败：${error.message || String(error)}`, "移除失败");
+      return 0;
     }
   }
 
@@ -479,12 +598,28 @@
     });
   }
 
-  function startDriveDownload(url, index, total) {
-    const position = `${index + 1}/${total}`;
-    updateDriveActivity("download", `下载 ${position}`);
-    return downloadDriveMedia(url, position)
-      .then((file) => ({ ok: true, file }))
-      .catch((error) => ({ ok: false, error }));
+  async function downloadDriveMediaWithRetry(url, position) {
+    let lastError;
+    for (let attempt = 1; attempt <= DRIVE_DOWNLOAD_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        return await downloadDriveMedia(url, position);
+      } catch (error) {
+        lastError = error;
+        if (attempt >= DRIVE_DOWNLOAD_MAX_ATTEMPTS || !isRetryableDriveError(error)) break;
+        const delayMs = DRIVE_RETRY_BASE_DELAY_MS * attempt;
+        addLog(`${position} 下载临时失败，${Math.ceil(delayMs / 1000)} 秒后重试（${attempt + 1}/${DRIVE_DOWNLOAD_MAX_ATTEMPTS}）。`, "自动重试");
+        await wait(delayMs);
+      }
+    }
+    throw lastError || new Error("Drive 文件下载失败。");
+  }
+
+  function isRetryableDriveError(error) {
+    const message = String(error && error.message ? error.message : error || "");
+    const statusMatch = message.match(/HTTP\s+(\d{3})/i);
+    const status = statusMatch ? Number(statusMatch[1]) : 0;
+    if (status) return status === 408 || status === 425 || status === 429 || status >= 500;
+    return /超时|failed to fetch|network|connection|temporar/i.test(message);
   }
 
   function ensureDriveLoader() {
@@ -514,9 +649,11 @@
     return new Promise((resolve, reject) => {
       const timeoutId = setTimeout(() => {
         pendingDriveDownloads.delete(requestId);
+        refreshDriveActivity();
         reject(new Error("Drive 文件下载超时。"));
       }, DRIVE_DOWNLOAD_TIMEOUT_MS);
-      pendingDriveDownloads.set(requestId, { resolve, reject, timeoutId, position });
+      pendingDriveDownloads.set(requestId, { resolve, reject, timeoutId, position, receivedBytes: 0, totalBytes: 0 });
+      refreshDriveActivity();
       driveLoaderFrame.contentWindow.postMessage({
         source: APP_ID,
         target: "drive-loader",
@@ -542,6 +679,12 @@
     return urls;
   }
 
+  function normalizeDriveBatchSize(value) {
+    const parsed = Number.parseInt(String(value || ""), 10);
+    if (!Number.isFinite(parsed)) return DEFAULT_DRIVE_BATCH_SIZE;
+    return Math.max(MIN_DRIVE_BATCH_SIZE, Math.min(MAX_DRIVE_BATCH_SIZE, parsed));
+  }
+
   function extractDriveFileId(value) {
     try {
       const url = new URL(String(value || "").trim());
@@ -562,10 +705,28 @@
     return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
   }
 
-  function updateDriveActivity(kind, value) {
-    state.driveActivity[kind] = value;
+  function formatDuration(value) {
+    const seconds = Math.max(0, Math.round((Number(value) || 0) / 1000));
+    if (seconds < 60) return `${seconds} 秒`;
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds % 60;
+    return remainder ? `${minutes} 分 ${remainder} 秒` : `${minutes} 分钟`;
+  }
+
+  function refreshDriveActivity() {
+    const downloads = Array.from(pendingDriveDownloads.values());
+    const receivedBytes = downloads.reduce((sum, item) => sum + (Number(item.receivedBytes) || 0), 0);
+    const totalBytes = downloads.reduce((sum, item) => sum + (Number(item.totalBytes) || 0), 0);
+    state.driveActivity.download = downloads.length
+      ? `下载中 ${downloads.length} 个 · ${formatBytes(receivedBytes)}${totalBytes ? `/${formatBytes(totalBytes)}` : ""}`
+      : "";
+    state.driveActivity.upload = activeDriveUploads.size ? `上传中 ${activeDriveUploads.size} 个` : "";
     const stages = [state.driveActivity.upload, state.driveActivity.download].filter(Boolean);
     if (stages.length) setStage(stages.join(" · "));
+  }
+
+  function wait(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
   async function extractAllSources() {
@@ -674,39 +835,116 @@
     state.logs = [];
     addLog("请求已发送，等待表格服务响应。", "登记");
     render();
+    const records = available.map((record) => ({
+      post_id: sourceNameToPostId(record.sourceName),
+      audio_content: record.transcript,
+      audio_content_zh: record.translation || ""
+    }));
+    const totalBatches = Math.ceil(records.length / SHEET_REGISTRATION_BATCH_SIZE);
+    const statusCounts = Object.create(null);
+    const failureLogs = [];
+    let totalSuccess = 0;
+    let totalFailed = 0;
+
     try {
-      const records = available.map((record) => ({
-        post_id: sourceNameToPostId(record.sourceName),
-        audio_content: record.transcript,
-        audio_content_zh: record.translation || ""
-      }));
-      const result = await callSheetUpsert(settings.deploymentUrl, databaseUrl, records);
-      if (!result || result.ok !== true) {
-        showApiFailure(result);
-        return;
+      for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
+        const batchStart = batchIndex * SHEET_REGISTRATION_BATCH_SIZE;
+        const batchRecords = records.slice(batchStart, batchStart + SHEET_REGISTRATION_BATCH_SIZE);
+        const batchLabel = `${batchIndex + 1}/${totalBatches}`;
+        setStage(`正在登记批次 ${batchLabel}（${batchRecords.length} 条）…`);
+        addLog(`批次 ${batchLabel} 已发送，共 ${batchRecords.length} 条。`, "登记");
+        render();
+
+        try {
+          const result = await callSheetUpsert(settings.deploymentUrl, databaseUrl, batchRecords);
+          if (!result || result.ok !== true) {
+            const apiError = (result && result.error) || {};
+            const status = (result && result.http_status) || "未知";
+            const requestId = (result && result.request_id) || "无";
+            totalFailed += batchRecords.length;
+            addStatusCount(statusCounts, "request_failed", batchRecords.length);
+            failureLogs.push({
+              title: `批次 ${batchLabel} 请求失败`,
+              message: [
+                `HTTP ${status} · request_id: ${requestId}`,
+                `${apiError.code || "UNKNOWN"}：${apiError.message || "服务未返回具体原因"}`,
+                `未登记 post_id：${batchRecords.map((record) => record.post_id).join("、")}`
+              ].join("\n")
+            });
+            addLog(`批次 ${batchLabel} 请求失败，已继续下一批。`, "登记失败");
+            continue;
+          }
+
+          const summary = (result.data && result.data.summary) || {};
+          const outcomes = Array.isArray(result.data && result.data.results) ? result.data.results : [];
+          mergeStatusCounts(statusCounts, summary.status_counts);
+
+          const outcomeSuccess = outcomes.filter((outcome) => outcome && outcome.success === true).length;
+          const outcomeFailed = outcomes.filter((outcome) => outcome && outcome.success === false).length;
+          let batchSuccess = parseStatusCount(summary.success, outcomeSuccess);
+          let batchFailed = parseStatusCount(summary.failed, outcomeFailed);
+          batchSuccess = Math.min(batchRecords.length, batchSuccess);
+          batchFailed = Math.min(batchRecords.length - batchSuccess, batchFailed);
+
+          const unaccounted = batchRecords.length - batchSuccess - batchFailed;
+          if (unaccounted > 0) {
+            batchFailed += unaccounted;
+            addStatusCount(statusCounts, "unreported_result", unaccounted);
+            const reportedIndexes = new Set(outcomes
+              .map((outcome) => Number(outcome && outcome.index))
+              .filter((index) => Number.isInteger(index) && index >= 0 && index < batchRecords.length));
+            const missingPostIds = batchRecords
+              .filter((_record, index) => !reportedIndexes.has(index))
+              .map((record) => record.post_id);
+            failureLogs.push({
+              title: `批次 ${batchLabel} 返回不完整`,
+              message: `服务未返回 ${unaccounted} 条记录的结果。未确认 post_id：${missingPostIds.join("、") || "无法确定"}`
+            });
+          }
+
+          totalSuccess += batchSuccess;
+          totalFailed += batchFailed;
+          outcomes.filter((outcome) => outcome && outcome.success === false).forEach((outcome) => {
+            const localIndex = Number(outcome.index);
+            const original = Number.isInteger(localIndex) ? batchRecords[localIndex] : null;
+            const postId = outcome.post_id || (original && original.post_id) || `总第 ${batchStart + (Number.isInteger(localIndex) ? localIndex : 0) + 1} 条`;
+            const error = outcome.error || {};
+            const code = error.code ? ` [${error.code}]` : "";
+            failureLogs.push({
+              title: "失败",
+              message: `${postId}${code}：${error.message || "处理失败（服务未返回具体原因）"}`
+            });
+          });
+          addLog(`批次 ${batchLabel} 完成：成功 ${batchSuccess}，失败 ${batchFailed}。`, "批次汇总");
+        } catch (error) {
+          const details = error.details || {};
+          totalFailed += batchRecords.length;
+          addStatusCount(statusCounts, "request_failed", batchRecords.length);
+          failureLogs.push({
+            title: `批次 ${batchLabel} 请求失败`,
+            message: [
+              `error.code: ${details.code || "REQUEST_FAILED"}`,
+              `http_status: ${details.http_status || "未知"}`,
+              `message: ${error.message || String(error)}`,
+              details.response_preview ? `response_preview: ${details.response_preview}` : "",
+              `未登记 post_id：${batchRecords.map((record) => record.post_id).join("、")}`
+            ].filter(Boolean).join("\n")
+          });
+          addLog(`批次 ${batchLabel} 请求异常，已继续下一批。`, "登记失败");
+        }
+        render();
       }
-      const summary = result.data && result.data.summary;
-      const outcomes = (result.data && result.data.results) || [];
-      state.logs = [];
-      addLog(formatStatusCounts(summary && summary.status_counts), "status_counts");
-      outcomes.filter((outcome) => outcome && outcome.success === false).forEach((outcome) => {
-        const original = records[Number.isInteger(outcome.index) ? outcome.index : -1];
-        const postId = outcome.post_id || (original && original.post_id) || `第 ${(outcome.index || 0) + 1} 条`;
-        const error = outcome.error || {};
-        const code = error.code ? ` [${error.code}]` : "";
-        addLog(`${postId}${code}：${error.message || "处理失败（服务未返回具体原因）"}`, "失败");
-      });
-      setStage(`登记完成：成功 ${(summary && summary.success) || 0}，失败 ${(summary && summary.failed) || 0}`);
-    } catch (error) {
-      setStage("登记失败");
-      const details = error.details || {};
-      state.logs = [];
-      addLog([
-        `error.code: ${details.code || "REQUEST_FAILED"}`,
-        `http_status: ${details.http_status || "未知"}`,
-        `message: ${error.message || String(error)}`,
-        details.response_preview ? `response_preview: ${details.response_preview}` : ""
-      ].filter(Boolean).join("\n"), "请求失败");
+
+      const logTime = new Date().toLocaleTimeString();
+      const visibleFailures = failureLogs.slice(0, Math.max(0, MAX_LOGS - 3));
+      const hiddenFailureCount = failureLogs.length - visibleFailures.length;
+      state.logs = [
+        { message: formatStatusCounts(statusCounts), kind: "status_counts", time: logTime },
+        { message: `共 ${records.length} 条，${totalBatches} 批；成功 ${totalSuccess}，失败 ${totalFailed}。`, kind: "登记汇总", time: logTime },
+        ...(hiddenFailureCount ? [{ message: `失败明细较多，当前显示前 ${visibleFailures.length} 条，另有 ${hiddenFailureCount} 条未展开。`, kind: "显示限制", time: logTime }] : []),
+        ...visibleFailures.map((entry) => ({ message: entry.message, kind: entry.title, time: logTime }))
+      ].slice(0, MAX_LOGS);
+      setStage(`登记完成：成功 ${totalSuccess}，失败 ${totalFailed}`);
     } finally {
       state.isBusy = false;
       render();
@@ -742,13 +980,20 @@
     });
   }
 
-  function showApiFailure(result) {
-    const apiError = (result && result.error) || {};
-    const status = (result && result.http_status) || "未知";
-    const requestId = (result && result.request_id) || "无";
-    setStage(`登记失败：HTTP ${status}`);
-    state.logs = [];
-    addLog(`http_status: ${status}\nrequest_id: ${requestId}\nerror.code: ${apiError.code || "UNKNOWN"}\nmessage: ${apiError.message || "服务未返回具体原因"}`, "接口失败");
+  function parseStatusCount(value, fallback = 0) {
+    const count = Number(value);
+    return Number.isFinite(count) && count >= 0 ? Math.floor(count) : fallback;
+  }
+
+  function addStatusCount(target, status, count) {
+    const amount = parseStatusCount(count);
+    if (!status || !amount) return;
+    target[status] = (target[status] || 0) + amount;
+  }
+
+  function mergeStatusCounts(target, incoming) {
+    if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) return;
+    Object.entries(incoming).forEach(([status, count]) => addStatusCount(target, status, count));
   }
 
   function formatStatusCounts(statusCounts) {
@@ -842,6 +1087,11 @@
     state.root.querySelectorAll("button:not([data-action='minimize']):not([data-action='show-results']):not([data-action='show-logs']):not([data-action='toggle-bottom'])").forEach((button) => { button.disabled = state.isBusy; });
     const driveInput = state.root.querySelector("[data-role='drive-urls']");
     if (driveInput) driveInput.disabled = state.isBusy;
+    const batchSizeInput = state.root.querySelector("[data-role='drive-batch-size']");
+    if (batchSizeInput) {
+      batchSizeInput.value = String(state.driveBatchSize);
+      batchSizeInput.disabled = state.isBusy;
+    }
     const minimizeButton = state.root.querySelector("[data-action='minimize']");
     minimizeButton.title = "最小化";
     minimizeButton.setAttribute("aria-label", "最小化");
@@ -1070,6 +1320,7 @@
       [PANEL_SETTINGS_KEY]: {
         translateEnabled: state.translateEnabled,
         autoDeleteImported: state.autoDeleteImported,
+        driveBatchSize: state.driveBatchSize,
         minimized: state.minimized,
         layout: state.panelLayout
       }
