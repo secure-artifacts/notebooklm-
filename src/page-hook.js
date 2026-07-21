@@ -707,7 +707,12 @@
     const projectMatch = window.location.pathname.match(/\/notebook\/([^/?#]+)/);
     const projectId = projectMatch && projectMatch[1];
     const runtimeText = collectRuntimeText();
-    const at = firstMatch(runtimeText, /AABr[a-zA-Z0-9_\-:.]+/);
+    const globalAt = window.WIZ_global_data && typeof window.WIZ_global_data.SNlM0e === "string"
+      ? window.WIZ_global_data.SNlM0e
+      : "";
+    const at = globalAt ||
+      extractJsonStringProperty(runtimeText, "SNlM0e") ||
+      firstMatch(runtimeText, /AABr[a-zA-Z0-9_\-:.]+/);
     const bl = firstMatch(runtimeText, /boq_labs-tailwind-frontend_[0-9A-Za-z_.-]+/) ||
       extractQueryParamFromRuntimeText(runtimeText, "bl");
     const fsid = extractQueryParamFromRuntimeText(runtimeText, "f.sid") ||
@@ -755,6 +760,19 @@
     }
 
     return parts.join("\n");
+  }
+
+  function extractJsonStringProperty(text, name) {
+    const escapedName = String(name || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(`"${escapedName}"\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`);
+    const match = String(text || "").match(regex);
+    if (!match) return "";
+    try {
+      const value = JSON.parse(match[1]);
+      return typeof value === "string" ? value : "";
+    } catch (_error) {
+      return "";
+    }
   }
 
   function extractQueryParamFromRuntimeText(text, name) {

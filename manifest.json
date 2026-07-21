@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "NotebookLM 转录登记",
-  "version": "0.9.5",
+  "version": "0.9.6",
   "description": "批量导入公开 Drive 音视频，提取与清理 NotebookLM 来源、可选翻译，并登记到 Google 表格后端。",
   "permissions": [
     "storage"
