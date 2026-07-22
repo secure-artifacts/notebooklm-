@@ -16,6 +16,12 @@
   const DRIVE_DOWNLOAD_MAX_ATTEMPTS = 3;
   const DRIVE_RETRY_BASE_DELAY_MS = 1000;
   const SHEET_REGISTRATION_BATCH_SIZE = 200;
+  const AI_TRANSLATION_BATCH_SIZE = 10;
+  const AI_TRANSLATION_TIMEOUT_MS = 5 * 60 * 1000;
+  const AI_TRANSLATION_RETRY_LIMIT = 1;
+  const AI_TRANSLATION_SPLIT_SIZE = 5;
+  const AI_TRANSLATION_POLL_MS = 500;
+  const AI_TRANSLATION_SETTLE_MS = 1400;
   const MAX_LOGS = 240;
   const EXTENSION_ORIGIN = `chrome-extension://${chrome.runtime.id}`;
   const PAGE_BRIDGE_TOKEN = typeof crypto.randomUUID === "function"
@@ -71,7 +77,7 @@
     const saved = await chrome.storage.local.get([PANEL_SETTINGS_KEY, SHEET_SETTINGS_KEY]);
     const panelSettings = saved[PANEL_SETTINGS_KEY] || {};
     const sheetSettings = saved[SHEET_SETTINGS_KEY] || {};
-    state.translateEnabled = Boolean(panelSettings.translateEnabled);
+    state.translateEnabled = panelSettings.aiTranslationEnabled === true;
     state.autoDeleteImported = panelSettings.autoDeleteImported !== false;
     state.driveBatchSize = normalizeDriveBatchSize(panelSettings.driveBatchSize);
     state.databaseUrl = String(sheetSettings.databaseUrl || "");
@@ -150,7 +156,7 @@
           <div><strong>转录登记</strong><span>NotebookLM 助手</span></div>
         </div>
         <div class="nlm-header-actions">
-          <label class="nlm-translate-toggle"><input type="checkbox" data-role="translate-toggle"><span>谷歌翻译</span></label>
+          <label class="nlm-translate-toggle"><input type="checkbox" data-role="translate-toggle"><span>AI 翻译</span></label>
           <button type="button" class="nlm-minimize" data-action="minimize" aria-label="最小化" title="最小化">−</button>
         </div>
       </header>
@@ -230,7 +236,7 @@
       if (state.translateEnabled && state.records.some((record) => record.transcript && !record.translation && !record.error)) {
         await translateExistingRecords();
       } else {
-        setStage(state.translateEnabled ? "翻译已开启" : "翻译已关闭");
+        setStage(state.translateEnabled ? "AI 翻译已开启" : "AI 翻译已关闭");
       }
     });
     state.root.querySelector("[data-role='auto-delete-toggle']").addEventListener("change", async (event) => {
@@ -372,9 +378,18 @@
         transcriptsAdded += extractionSummary.transcriptsAdded;
         processingFailed += extractionSummary.processingFailed;
 
+        let translationSummary = emptyTranslationSummary();
+        if (state.translateEnabled && extractionSummary.extractedSourceIds.length) {
+          setStage(`批次 ${batchLabel}：正在进行 AI 翻译…`);
+          translationSummary = await translateRecords({ sourceIds: extractionSummary.extractedSourceIds });
+        }
+
+        const deletionCandidates = state.translateEnabled
+          ? translationSummary.translatedSourceIds
+          : extractionSummary.extractedSourceIds;
         let batchDeleted = 0;
-        if (state.autoDeleteImported && extractionSummary.extractedSourceIds.length) {
-          batchDeleted = await deleteImportedBatch(extractionSummary.extractedSourceIds, batchLabel);
+        if (state.autoDeleteImported && deletionCandidates.length) {
+          batchDeleted = await deleteImportedBatch(deletionCandidates, batchLabel);
           autoDeleted += batchDeleted;
         }
 
@@ -388,16 +403,11 @@
 
         addLog(
           `批次 ${batchLabel} 完成：上传成功 ${uploadSummary.succeeded}，上传失败 ${uploadSummary.failed}，` +
-          `转录成功 ${extractionSummary.transcriptsAdded}，转录失败 ${extractionSummary.processingFailed}，自动移除 ${batchDeleted}。`,
+          `转录成功 ${extractionSummary.transcriptsAdded}，转录失败 ${extractionSummary.processingFailed}，` +
+          `AI 翻译成功 ${translationSummary.translated}，失败 ${translationSummary.failed}，自动移除 ${batchDeleted}。`,
           "批次汇总"
         );
         render();
-      }
-
-      if (state.translateEnabled && transcriptsAdded) {
-        setStage(`全部 ${totalBatches} 个批次已完成，正在翻译转录…`);
-        addLog("所有导入批次已完成并释放可移除来源，开始统一翻译。", "翻译");
-        await translateRecords();
       }
 
       const totalFailed = failed + processingFailed;
@@ -767,12 +777,19 @@
     records.forEach((incoming) => {
       const record = {
         ...incoming,
+        sourceOriginalName: String(incoming.sourceName || "").trim(),
         sourceName: stripSourceSuffix(incoming.sourceName)
       };
       const existingIndex = record.sourceId
         ? state.records.findIndex((item) => item.sourceId === record.sourceId)
         : -1;
-      if (existingIndex >= 0) state.records[existingIndex] = { ...state.records[existingIndex], ...record };
+      if (existingIndex >= 0) {
+        state.records[existingIndex] = {
+          ...state.records[existingIndex],
+          ...record,
+          sourceOriginalName: record.sourceOriginalName || state.records[existingIndex].sourceOriginalName || state.records[existingIndex].sourceName
+        };
+      }
       else state.records.push(record);
       if (record.transcript && !record.error) transcriptCount += 1;
     });
@@ -781,29 +798,312 @@
 
   async function translateExistingRecords() {
     state.isBusy = true;
+    state.bottomOpen = true;
+    state.bottomView = "results";
     render();
     try {
-      await translateRecords();
-      setStage("已有转录已翻译");
+      const summary = await translateRecords();
+      setStage(summary.failed
+        ? `AI 翻译完成：成功 ${summary.translated}，失败 ${summary.failed}`
+        : summary.translated
+        ? `AI 翻译完成：成功 ${summary.translated}`
+        : "没有可进行 AI 翻译的来源");
     } finally {
       state.isBusy = false;
       render();
     }
   }
 
-  async function translateRecords() {
-    const records = state.records.filter((record) => record.transcript && !record.error && !record.translation);
-    for (let index = 0; index < records.length; index += 1) {
-      const record = records[index];
-      setStage(`正在翻译 ${index + 1}/${records.length}`);
-      try {
-        record.translation = await callGoogleTranslate(record.transcript);
-      } catch (error) {
-        record.translationError = error.message || String(error);
-        addLog(`${record.sourceName || "未命名来源"}：${record.translationError}`, "翻译失败");
+  async function translateRecords(options = {}) {
+    const requestedSourceIds = new Set(Array.isArray(options.sourceIds) ? options.sourceIds.filter(Boolean) : []);
+    const records = state.records.filter((record) => {
+      if (!record.transcript || record.error || record.translation) return false;
+      return !requestedSourceIds.size || requestedSourceIds.has(record.sourceId);
+    });
+    const summary = emptyTranslationSummary();
+    if (!records.length) return summary;
+
+    const originalSelection = captureNotebookSourceSelection();
+    try {
+      for (let offset = 0; offset < records.length; offset += AI_TRANSLATION_BATCH_SIZE) {
+        const batch = records.slice(offset, offset + AI_TRANSLATION_BATCH_SIZE);
+        const batchLabel = `${Math.floor(offset / AI_TRANSLATION_BATCH_SIZE) + 1}/${Math.ceil(records.length / AI_TRANSLATION_BATCH_SIZE)}`;
+        setStage(`AI 翻译批次 ${batchLabel}（${batch.length} 个来源）…`);
+        addLog(`AI 翻译批次 ${batchLabel}：准备 ${batch.length} 个已有转录来源。`, "AI 翻译");
+        const batchSummary = await translateAiBatchWithRecovery(batch, batchLabel);
+        summary.translated += batchSummary.translated;
+        summary.failed += batchSummary.failed;
+        summary.translatedSourceIds.push(...batchSummary.translatedSourceIds);
+        render();
       }
-      render();
+    } finally {
+      restoreNotebookSourceSelection(originalSelection);
     }
+    return summary;
+  }
+
+  function emptyTranslationSummary() {
+    return { translated: 0, failed: 0, translatedSourceIds: [] };
+  }
+
+  async function translateAiBatchWithRecovery(records, batchLabel, allowSplit = true) {
+    const summary = emptyTranslationSummary();
+    let pending = records.slice();
+    let lastError = "";
+
+    for (let attempt = 0; pending.length && attempt <= AI_TRANSLATION_RETRY_LIMIT; attempt += 1) {
+      try {
+        const sourceControls = selectNotebookSourcesForRecords(pending);
+        if (sourceControls.missing.length) {
+          sourceControls.missing.forEach((record) => {
+            record.translationError = "当前 NotebookLM 中找不到该来源，可能已自动移除；无法进行 AI 翻译。";
+            addLog(`${record.sourceName || "未命名来源"}：${record.translationError}`, "AI 翻译跳过");
+          });
+          summary.failed += sourceControls.missing.length;
+          pending = sourceControls.selected;
+        }
+        if (!pending.length) break;
+
+        await wait(220);
+        if (!notebookSourcesAreSelected(pending)) {
+          throw new Error("NotebookLM 未能切换到当前翻译来源，请重试。");
+        }
+        const payload = await submitNotebookAiTranslationPrompt();
+        const result = mergeAiTranslationPayload(payload, pending);
+        summary.translated += result.translated.length;
+        summary.translatedSourceIds.push(...result.translated.map((record) => record.sourceId).filter(Boolean));
+        pending = result.missing;
+        if (result.unknown.length) {
+          addLog(`批次 ${batchLabel} 返回 ${result.unknown.length} 条无法匹配的来源，已忽略。`, "AI 翻译校验");
+        }
+        if (pending.length) {
+          addLog(`批次 ${batchLabel} 仍缺少 ${pending.length} 条翻译，将仅重试缺少来源。`, "AI 翻译重试");
+        }
+      } catch (error) {
+        lastError = error && error.message ? error.message : String(error);
+        addLog(`批次 ${batchLabel} 第 ${attempt + 1} 次请求失败：${lastError}`, "AI 翻译失败");
+      }
+    }
+
+    if (pending.length && allowSplit && pending.length > AI_TRANSLATION_SPLIT_SIZE) {
+      addLog(`批次 ${batchLabel} 未完成 ${pending.length} 条，拆分为最多 ${AI_TRANSLATION_SPLIT_SIZE} 条后重试。`, "AI 翻译恢复");
+      for (let index = 0; index < pending.length; index += AI_TRANSLATION_SPLIT_SIZE) {
+        const child = await translateAiBatchWithRecovery(
+          pending.slice(index, index + AI_TRANSLATION_SPLIT_SIZE),
+          `${batchLabel}.${Math.floor(index / AI_TRANSLATION_SPLIT_SIZE) + 1}`,
+          false
+        );
+        summary.translated += child.translated;
+        summary.failed += child.failed;
+        summary.translatedSourceIds.push(...child.translatedSourceIds);
+      }
+      return summary;
+    }
+
+    pending.forEach((record) => {
+      record.translationError = lastError || "NotebookLM 未返回该来源的完整中文翻译。";
+      addLog(`${record.sourceName || "未命名来源"}：${record.translationError}`, "AI 翻译失败");
+    });
+    summary.failed += pending.length;
+    return summary;
+  }
+
+  function captureNotebookSourceSelection() {
+    return getNotebookSourceControls().map((control) => ({ name: control.name, checked: control.checkbox.checked }));
+  }
+
+  function restoreNotebookSourceSelection(snapshot) {
+    if (!Array.isArray(snapshot)) return;
+    const desiredByName = new Map(snapshot.map((item) => [item.name, Boolean(item.checked)]));
+    getNotebookSourceControls().forEach((control) => {
+      if (!desiredByName.has(control.name)) return;
+      const desired = desiredByName.get(control.name);
+      if (control.checkbox.checked !== desired) control.checkbox.click();
+    });
+  }
+
+  function getNotebookSourceControls() {
+    return Array.from(document.querySelectorAll(".single-source-container"))
+      .map((container) => {
+        const button = container.querySelector("button.source-stretched-button[aria-label]");
+        const checkbox = container.querySelector('input[type="checkbox"]');
+        return { container, button, checkbox, name: button ? String(button.getAttribute("aria-label") || "").trim() : "" };
+      })
+      .filter((item) => item.name && item.checkbox);
+  }
+
+  function selectNotebookSourcesForRecords(records) {
+    const controls = getNotebookSourceControls();
+    const available = controls.slice();
+    const selected = [];
+    const missing = [];
+    records.forEach((record) => {
+      const matchIndex = available.findIndex((control) => sourceNamesMatch(control.name, record.sourceOriginalName || record.sourceName));
+      if (matchIndex < 0) {
+        missing.push(record);
+        return;
+      }
+      const [control] = available.splice(matchIndex, 1);
+      selected.push(record);
+      record._aiSourceControlName = control.name;
+    });
+
+    const targetNames = new Set(selected.map((record) => record._aiSourceControlName));
+    controls.forEach((control) => {
+      const shouldSelect = targetNames.has(control.name);
+      if (control.checkbox.checked !== shouldSelect) control.checkbox.click();
+    });
+    return { selected, missing };
+  }
+
+  function sourceNamesMatch(left, right) {
+    const normalize = (value) => stripSourceSuffix(String(value || "")).replace(/\s+/g, " ").trim().toLocaleLowerCase();
+    return Boolean(left && right && normalize(left) === normalize(right));
+  }
+
+  function notebookSourcesAreSelected(records) {
+    const selectedNames = new Set(records.map((record) => record._aiSourceControlName));
+    return selectedNames.size === records.length && getNotebookSourceControls().every((control) => control.checkbox.checked === selectedNames.has(control.name));
+  }
+
+  async function submitNotebookAiTranslationPrompt() {
+    const chatPanel = document.querySelector(".chat-panel");
+    const input = document.querySelector('textarea[aria-label="查询框"]');
+    if (!chatPanel || !input) throw new Error("未找到 NotebookLM 对话框，请刷新页面后重试。");
+    const knownPayloads = new Set(getNotebookAiResponseTexts(chatPanel)
+      .flatMap((text) => extractJsonArrayCandidates(text).map((item) => item.raw)));
+    const prompt = buildAiTranslationPrompt();
+    setNativeTextareaValue(input, prompt);
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: prompt }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+
+    const submit = document.querySelector('button[type="submit"][aria-label="提交"]');
+    const ready = await waitForCondition(() => submit && !submit.disabled, 6000, 100);
+    if (!ready) throw new Error("NotebookLM 未能启用发送按钮，请确认页面已加载完成。");
+    submit.click();
+    return waitForNotebookAiJson(chatPanel, knownPayloads);
+  }
+
+  function buildAiTranslationPrompt() {
+    return [
+      "请将当前选中的全部来源分别完整翻译成中文。",
+      "不得概括、删减、合并来源。",
+      "请仅输出合法 JSON 数组，不要使用 Markdown 代码块，不要解释。",
+      "格式必须完全为：",
+      '[{"source_name":"来源名","zh":"完整中文翻译"}]'
+    ].join("\n");
+  }
+
+  function setNativeTextareaValue(textarea, value) {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");
+    if (!descriptor || typeof descriptor.set !== "function") throw new Error("无法写入 NotebookLM 对话框。");
+    descriptor.set.call(textarea, value);
+  }
+
+  async function waitForNotebookAiJson(chatPanel, knownPayloads) {
+    const deadline = Date.now() + AI_TRANSLATION_TIMEOUT_MS;
+    let stableRaw = "";
+    let stableSince = 0;
+    while (Date.now() < deadline) {
+      const candidates = getNotebookAiResponseTexts(chatPanel)
+        .flatMap((text) => extractJsonArrayCandidates(text))
+        .filter((item) => !knownPayloads.has(item.raw))
+        .filter((item) => item.value.some((row) => row && typeof row === "object" && typeof row.source_name === "string" && typeof row.zh === "string" && row.zh.trim() && row.zh.trim() !== "完整中文翻译"));
+      const newest = candidates[candidates.length - 1];
+      if (newest) {
+        if (newest.raw !== stableRaw) {
+          stableRaw = newest.raw;
+          stableSince = Date.now();
+        } else if (Date.now() - stableSince >= AI_TRANSLATION_SETTLE_MS) {
+          return newest.value;
+        }
+      }
+      await wait(AI_TRANSLATION_POLL_MS);
+    }
+    throw new Error("等待 NotebookLM AI 翻译超时，未收到完整 JSON 结果。");
+  }
+
+  function getNotebookAiResponseTexts(chatPanel) {
+    return Array.from(chatPanel.querySelectorAll(".to-user-message-inner-content"))
+      .map((message) => {
+        const content = message.querySelector(".message-text-content") || message;
+        const clone = content.cloneNode(true);
+        clone.querySelectorAll(".citation-marker").forEach((marker) => marker.remove());
+        return String(clone.textContent || "").trim();
+      })
+      .filter(Boolean);
+  }
+
+  function extractJsonArrayCandidates(text) {
+    const source = String(text || "");
+    const candidates = [];
+    for (let start = source.indexOf("["); start >= 0; start = source.indexOf("[", start + 1)) {
+      let depth = 0;
+      let quote = "";
+      let escaped = false;
+      for (let index = start; index < source.length; index += 1) {
+        const char = source[index];
+        if (quote) {
+          if (escaped) escaped = false;
+          else if (char === "\\") escaped = true;
+          else if (char === quote) quote = "";
+          continue;
+        }
+        if (char === '"') {
+          quote = char;
+          continue;
+        }
+        if (char === "[") depth += 1;
+        else if (char === "]") {
+          depth -= 1;
+          if (!depth) {
+            const raw = source.slice(start, index + 1);
+            try {
+              const value = JSON.parse(raw);
+              if (Array.isArray(value)) candidates.push({ raw, value });
+            } catch (_error) {
+              // Keep scanning: streamed answers are often incomplete before the final update.
+            }
+            break;
+          }
+        }
+      }
+    }
+    return candidates;
+  }
+
+  function mergeAiTranslationPayload(payload, records) {
+    const unmatchedRecords = records.slice();
+    const translated = [];
+    const unknown = [];
+    (Array.isArray(payload) ? payload : []).forEach((item) => {
+      if (!item || typeof item !== "object" || typeof item.source_name !== "string" || typeof item.zh !== "string" || !item.zh.trim()) {
+        unknown.push(item);
+        return;
+      }
+      const index = unmatchedRecords.findIndex((record) => sourceNamesMatch(item.source_name, record.sourceOriginalName || record.sourceName));
+      if (index < 0) {
+        unknown.push(item);
+        return;
+      }
+      const [record] = unmatchedRecords.splice(index, 1);
+      record.translation = item.zh.trim();
+      record.translationError = "";
+      translated.push(record);
+    });
+    return { translated, missing: unmatchedRecords, unknown };
+  }
+
+  function waitForCondition(check, timeoutMs, intervalMs) {
+    const deadline = Date.now() + timeoutMs;
+    return new Promise((resolve) => {
+      const poll = () => {
+        if (check()) return resolve(true);
+        if (Date.now() >= deadline) return resolve(false);
+        setTimeout(poll, intervalMs);
+      };
+      poll();
+    });
   }
 
   async function registerToSheet() {
@@ -960,13 +1260,6 @@
       }, timeoutMs);
       pendingRequests.set(requestId, { resolve, reject, timeoutId });
       window.postMessage({ source: APP_ID, target: "page", type: "api-request", token: PAGE_BRIDGE_TOKEN, requestId, action, payload }, window.location.origin);
-    });
-  }
-
-  function callGoogleTranslate(text) {
-    return sendBackgroundMessage({ type: "translate-burmese-to-chinese", text }).then((response) => {
-      if (response && response.ok) return response.translation || "";
-      throw new Error((response && response.error) || "谷歌翻译失败。");
     });
   }
 
@@ -1318,7 +1611,7 @@
   async function savePanelSettings() {
     await chrome.storage.local.set({
       [PANEL_SETTINGS_KEY]: {
-        translateEnabled: state.translateEnabled,
+        aiTranslationEnabled: state.translateEnabled,
         autoDeleteImported: state.autoDeleteImported,
         driveBatchSize: state.driveBatchSize,
         minimized: state.minimized,
