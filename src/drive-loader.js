@@ -2,7 +2,10 @@
   "use strict";
 
   const APP_ID = "nlm-video-translation-helper";
-  const NOTEBOOKLM_ORIGIN = "https://notebooklm.google.com";
+  const NOTEBOOKLM_ORIGINS = new Set([
+    "https://notebooklm.google.com",
+    "https://notebook.google.com"
+  ]);
   const MAX_MEDIA_BYTES = 512 * 1024 * 1024;
   const AUDIO_EXTENSIONS = new Set(["aac", "flac", "m4a", "mp3", "oga", "ogg", "opus", "wav", "weba"]);
   const VIDEO_EXTENSIONS = new Set(["3gp", "avi", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "ogv", "webm"]);
@@ -32,20 +35,20 @@
   window.addEventListener("message", handleMessage);
 
   function handleMessage(event) {
-    if (event.source !== parent || event.origin !== NOTEBOOKLM_ORIGIN) return;
+    if (event.source !== parent || !NOTEBOOKLM_ORIGINS.has(event.origin)) return;
     const message = event.data;
     if (!message || message.source !== APP_ID || message.target !== "drive-loader" || message.token !== bridgeToken) return;
     if (message.type !== "drive-download-request") return;
 
-    downloadPublicDriveMedia(message.url, message.requestId)
-      .then((file) => postResult(message.requestId, { ok: true, file, mediaType: file.type, size: file.size }))
-      .catch((error) => postResult(message.requestId, {
+    downloadPublicDriveMedia(message.url, message.requestId, event.origin)
+      .then((file) => postResult(event.origin, message.requestId, { ok: true, file, mediaType: file.type, size: file.size }))
+      .catch((error) => postResult(event.origin, message.requestId, {
         ok: false,
         error: error && error.message ? error.message : String(error)
       }));
   }
 
-  async function downloadPublicDriveMedia(sharedUrl, requestId) {
+  async function downloadPublicDriveMedia(sharedUrl, requestId, parentOrigin) {
     const reference = extractDriveReference(sharedUrl);
     if (!reference) throw new Error("不是有效的 Google Drive 文件链接。");
     const { fileId, resourceKey } = reference;
@@ -90,7 +93,7 @@
           throw new Error("文件超过 512 MB，已停止下载以防浏览器内存不足。");
         }
         chunks.push(value);
-        postProgress(requestId, receivedBytes, declaredLength);
+        postProgress(parentOrigin, requestId, receivedBytes, declaredLength);
       }
     } else {
       const buffer = await response.arrayBuffer();
@@ -238,7 +241,7 @@
     return preferred[mimeType] || (mimeType.startsWith("video/") ? "mp4" : "mp3");
   }
 
-  function postProgress(requestId, receivedBytes, totalBytes) {
+  function postProgress(parentOrigin, requestId, receivedBytes, totalBytes) {
     parent.postMessage({
       source: APP_ID,
       target: "content",
@@ -246,10 +249,10 @@
       token: bridgeToken,
       requestId,
       payload: { receivedBytes, totalBytes }
-    }, NOTEBOOKLM_ORIGIN);
+    }, parentOrigin);
   }
 
-  function postResult(requestId, payload) {
+  function postResult(parentOrigin, requestId, payload) {
     parent.postMessage({
       source: APP_ID,
       target: "content",
@@ -257,6 +260,6 @@
       token: bridgeToken,
       requestId,
       payload
-    }, NOTEBOOKLM_ORIGIN);
+    }, parentOrigin);
   }
 })();

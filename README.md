@@ -6,7 +6,7 @@
 
 - 提取每个已有来源的名称和完整转录文字。
 - 粘贴多个公开 Google Drive 文件链接，自动识别音频/视频；默认每批处理 10 个，可在 1–25 之间调整。批内固定采用最多 3 路受控下载/上传并发，临时网络错误自动重试；每批提取并清理成功来源后继续下一批，所有批次结束后再统一执行可选翻译。
-- 浮动面板只在具体笔记本页面显示；扩展图标弹窗可直接打开 NotebookLM 首页。
+- 浮动面板只在具体笔记本页面显示；兼容 `notebooklm.google.com/notebook/...` 与 `notebook.google.com/notebook/...` 两种地址；扩展图标弹窗可直接打开 NotebookLM 首页。
 - Drive 导入不需要 OAuth，不读取登录 Cookie；文件必须设置为“知道链接的任何人可查看”并允许下载。
 - 默认在本次导入来源成功取得转录后自动将其从 NotebookLM 移除，释放每个笔记本的来源名额；失败来源会保留以便重试。
 - 兼容 NotebookLM 当前的 `SNlM0e` 运行参数格式，同时保留旧版参数格式回退。
@@ -88,11 +88,11 @@ git push origin main
 
 #### 2. 创建并推送版本 Tag
 
-版本号使用 `v主版本.次版本.修订版本` 格式，例如 `v0.9.7`。
+版本号使用 `v主版本.次版本.修订版本` 格式，例如 `v0.9.8`。
 
 ```bash
-git tag -a v0.9.7 -m "Release version 0.9.7"
-git push origin v0.9.7
+git tag -a v0.9.8 -m "Release version 0.9.8"
+git push origin v0.9.8
 ```
 
 推送后，GitHub Actions 会自动：
@@ -114,8 +114,8 @@ git push origin v0.9.7
 3. 重新创建相同版本的 Tag 并推送：
 
 ```bash
-git tag -d v0.9.7
-git push origin :refs/tags/v0.9.7
-git tag -a v0.9.7 -m "Release version 0.9.7"
-git push origin v0.9.7
+git tag -d v0.9.8
+git push origin :refs/tags/v0.9.8
+git tag -a v0.9.8 -m "Release version 0.9.8"
+git push origin v0.9.8
 ```
