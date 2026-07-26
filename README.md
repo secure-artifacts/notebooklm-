@@ -2,6 +2,15 @@
 
 这是一个本地加载的 Chrome/Edge 扩展：把公开的 Google Drive 音视频批量加入当前 NotebookLM 笔记本，逐个读取来源转录稿，可选通过 NotebookLM AI 翻译为中文，并把结果登记到你的 Google Sheets 数据库服务。
 
+> 当前版本：[`v0.9.8`](https://github.com/secure-artifacts/notebooklm-/releases/tag/v0.9.8) · 下载并解压 Release 中的 ZIP 后，在浏览器扩展管理页使用「加载已解压的扩展程序」导入。
+
+## 最新更新
+
+### v0.9.8
+
+- 新增兼容 `https://notebook.google.com/notebook/...` 笔记本地址，同时保留原有 `notebooklm.google.com` 地址支持。
+- Drive 下载组件会根据当前 NotebookLM 域名安全回传下载进度与结果，确保新地址下的批量导入可用。
+
 ## 功能
 
 - 提取每个已有来源的名称和完整转录文字。
