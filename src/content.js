@@ -967,21 +967,75 @@
   }
 
   async function submitNotebookAiTranslationPrompt() {
-    const chatPanel = document.querySelector(".chat-panel");
-    const input = document.querySelector('textarea[aria-label="查询框"]');
-    if (!chatPanel || !input) throw new Error("未找到 NotebookLM 对话框，请刷新页面后重试。");
-    const knownPayloads = new Set(getNotebookAiResponseTexts(chatPanel)
+    const input = findNotebookChatInput();
+    const chatPanel = findNotebookChatPanel(input);
+    if (!input) throw new Error("未找到 NotebookLM 对话输入框，请确认笔记本页面已加载完成后重试。");
+    const knownPayloads = new Set(getNotebookAiResponseTexts(chatPanel || document)
       .flatMap((text) => extractJsonArrayCandidates(text).map((item) => item.raw)));
     const prompt = buildAiTranslationPrompt();
     setNativeTextareaValue(input, prompt);
     input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: prompt }));
     input.dispatchEvent(new Event("change", { bubbles: true }));
 
-    const submit = document.querySelector('button[type="submit"][aria-label="提交"]');
-    const ready = await waitForCondition(() => submit && !submit.disabled, 6000, 100);
+    const ready = await waitForCondition(() => {
+      const submit = findNotebookChatSubmit(input, chatPanel);
+      return Boolean(submit && !submit.disabled);
+    }, 6000, 100);
     if (!ready) throw new Error("NotebookLM 未能启用发送按钮，请确认页面已加载完成。");
+    const submit = findNotebookChatSubmit(input, chatPanel);
+    if (!submit) throw new Error("未找到 NotebookLM 对话发送按钮，请刷新页面后重试。");
     submit.click();
-    return waitForNotebookAiJson(chatPanel, knownPayloads);
+    return waitForNotebookAiJson(chatPanel || document, knownPayloads);
+  }
+
+  function findNotebookChatInput() {
+    const chatPanel = document.querySelector(".chat-panel");
+    const scopedCandidates = chatPanel
+      ? Array.from(chatPanel.querySelectorAll("textarea"))
+      : [];
+    const knownLabels = [
+      "查询框",
+      "查詢方塊",
+      "Query box"
+    ];
+    const labelledCandidates = knownLabels.flatMap((label) =>
+      Array.from(document.querySelectorAll(`textarea[aria-label="${label}"]`)));
+    const structuralCandidates = Array.from(document.querySelectorAll("textarea"))
+      .filter((textarea) => {
+        if (state.root && state.root.contains(textarea)) return false;
+        const form = textarea.closest("form");
+        return Boolean(form && form.querySelector('button[type="submit"]'));
+      });
+    return [...scopedCandidates, ...labelledCandidates, ...structuralCandidates]
+      .find(isUsableNotebookControl) || null;
+  }
+
+  function findNotebookChatPanel(input) {
+    return document.querySelector(".chat-panel") ||
+      (input && input.closest(".chat-panel")) ||
+      null;
+  }
+
+  function findNotebookChatSubmit(input, chatPanel) {
+    const scopes = [
+      input && input.closest("form"),
+      chatPanel
+    ].filter(Boolean);
+    for (const scope of scopes) {
+      const submit = Array.from(scope.querySelectorAll('button[type="submit"]'))
+        .find(isUsableNotebookControl);
+      if (submit) return submit;
+    }
+    return Array.from(document.querySelectorAll('button[type="submit"]'))
+      .filter((button) => !(state.root && state.root.contains(button)))
+      .find(isUsableNotebookControl) || null;
+  }
+
+  function isUsableNotebookControl(element) {
+    if (!element || element.disabled || element.hidden) return false;
+    if (element.getAttribute("aria-hidden") === "true") return false;
+    const style = window.getComputedStyle(element);
+    return style.display !== "none" && style.visibility !== "hidden";
   }
 
   function buildAiTranslationPrompt() {

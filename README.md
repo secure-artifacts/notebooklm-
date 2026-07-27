@@ -2,9 +2,14 @@
 
 这是一个本地加载的 Chrome/Edge 扩展：把公开的 Google Drive 音视频批量加入当前 NotebookLM 笔记本，逐个读取来源转录稿，可选通过 NotebookLM AI 翻译为中文，并把结果登记到你的 Google Sheets 数据库服务。
 
-> 当前版本：[`v0.9.8`](https://github.com/secure-artifacts/notebooklm-/releases/tag/v0.9.8) · 下载并解压 Release 中的 ZIP 后，在浏览器扩展管理页使用「加载已解压的扩展程序」导入。
+> 当前版本：[`v0.9.9`](https://github.com/secure-artifacts/notebooklm-/releases/tag/v0.9.9) · 下载并解压 Release 中的 ZIP 后，在浏览器扩展管理页使用「加载已解压的扩展程序」导入。
 
 ## 最新更新
+
+### v0.9.9
+
+- AI 对话输入框与发送按钮改为页面结构优先识别，不再依赖简体中文界面文案。
+- 兼容简体中文、繁体中文和英文标签；其他语言在 NotebookLM 对话结构不变时同样可以识别。
 
 ### v0.9.8
 
@@ -98,11 +103,11 @@ git push origin main
 
 #### 2. 创建并推送版本 Tag
 
-版本号使用 `v主版本.次版本.修订版本` 格式，例如 `v0.9.8`。
+版本号使用 `v主版本.次版本.修订版本` 格式，例如 `v0.9.9`。
 
 ```bash
-git tag -a v0.9.8 -m "Release version 0.9.8"
-git push origin v0.9.8
+git tag -a v0.9.9 -m "Release version 0.9.9"
+git push origin v0.9.9
 ```
 
 推送后，GitHub Actions 会自动：
@@ -124,8 +129,8 @@ git push origin v0.9.8
 3. 重新创建相同版本的 Tag 并推送：
 
 ```bash
-git tag -d v0.9.8
-git push origin :refs/tags/v0.9.8
-git tag -a v0.9.8 -m "Release version 0.9.8"
-git push origin v0.9.8
+git tag -d v0.9.9
+git push origin :refs/tags/v0.9.9
+git tag -a v0.9.9 -m "Release version 0.9.9"
+git push origin v0.9.9
 ```
