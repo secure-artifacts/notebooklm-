@@ -1,6 +1,12 @@
 (function () {
   "use strict";
 
+  const AiTranslationUtils = globalThis.NlmAiTranslationUtils;
+  const NotebookDom = globalThis.NlmNotebookDom;
+  if (!AiTranslationUtils || !NotebookDom) {
+    throw new Error("NotebookLM 扩展模块未正确加载，请重新加载扩展。");
+  }
+
   const APP_ID = "nlm-video-translation-helper";
   const PANEL_SETTINGS_KEY = "nlmTranscriptPanelSettings";
   const SHEET_SETTINGS_KEY = "nlmSheetApiSettings";
@@ -823,7 +829,7 @@
     const summary = emptyTranslationSummary();
     if (!records.length) return summary;
 
-    const originalSelection = captureNotebookSourceSelection();
+    const originalSelection = NotebookDom.captureSourceSelection(document);
     try {
       for (let offset = 0; offset < records.length; offset += AI_TRANSLATION_BATCH_SIZE) {
         const batch = records.slice(offset, offset + AI_TRANSLATION_BATCH_SIZE);
@@ -837,7 +843,7 @@
         render();
       }
     } finally {
-      restoreNotebookSourceSelection(originalSelection);
+      NotebookDom.restoreSourceSelection(originalSelection, document);
     }
     return summary;
   }
@@ -853,7 +859,11 @@
 
     for (let attempt = 0; pending.length && attempt <= AI_TRANSLATION_RETRY_LIMIT; attempt += 1) {
       try {
-        const sourceControls = selectNotebookSourcesForRecords(pending);
+        const sourceControls = NotebookDom.selectSourcesForRecords(
+          pending,
+          AiTranslationUtils.sourceNamesMatch,
+          document
+        );
         if (sourceControls.missing.length) {
           sourceControls.missing.forEach((record) => {
             record.translationError = "当前 NotebookLM 中找不到该来源，可能已自动移除；无法进行 AI 翻译。";
@@ -865,11 +875,11 @@
         if (!pending.length) break;
 
         await wait(220);
-        if (!notebookSourcesAreSelected(pending)) {
+        if (!NotebookDom.sourcesAreSelected(pending, document)) {
           throw new Error("NotebookLM 未能切换到当前翻译来源，请重试。");
         }
         const payload = await submitNotebookAiTranslationPrompt();
-        const result = mergeAiTranslationPayload(payload, pending);
+        const result = AiTranslationUtils.mergeTranslationPayload(payload, pending);
         summary.translated += result.translated.length;
         summary.translatedSourceIds.push(...result.translated.map((record) => record.sourceId).filter(Boolean));
         pending = result.missing;
@@ -908,144 +918,26 @@
     return summary;
   }
 
-  function captureNotebookSourceSelection() {
-    return getNotebookSourceControls().map((control) => ({ name: control.name, checked: control.checkbox.checked }));
-  }
-
-  function restoreNotebookSourceSelection(snapshot) {
-    if (!Array.isArray(snapshot)) return;
-    const desiredByName = new Map(snapshot.map((item) => [item.name, Boolean(item.checked)]));
-    getNotebookSourceControls().forEach((control) => {
-      if (!desiredByName.has(control.name)) return;
-      const desired = desiredByName.get(control.name);
-      if (control.checkbox.checked !== desired) control.checkbox.click();
-    });
-  }
-
-  function getNotebookSourceControls() {
-    return Array.from(document.querySelectorAll(".single-source-container"))
-      .map((container) => {
-        const button = container.querySelector("button.source-stretched-button[aria-label]");
-        const checkbox = container.querySelector('input[type="checkbox"]');
-        return { container, button, checkbox, name: button ? String(button.getAttribute("aria-label") || "").trim() : "" };
-      })
-      .filter((item) => item.name && item.checkbox);
-  }
-
-  function selectNotebookSourcesForRecords(records) {
-    const controls = getNotebookSourceControls();
-    const available = controls.slice();
-    const selected = [];
-    const missing = [];
-    records.forEach((record) => {
-      const matchIndex = available.findIndex((control) => sourceNamesMatch(control.name, record.sourceOriginalName || record.sourceName));
-      if (matchIndex < 0) {
-        missing.push(record);
-        return;
-      }
-      const [control] = available.splice(matchIndex, 1);
-      selected.push(record);
-      record._aiSourceControlName = control.name;
-    });
-
-    const targetNames = new Set(selected.map((record) => record._aiSourceControlName));
-    controls.forEach((control) => {
-      const shouldSelect = targetNames.has(control.name);
-      if (control.checkbox.checked !== shouldSelect) control.checkbox.click();
-    });
-    return { selected, missing };
-  }
-
-  function sourceNamesMatch(left, right) {
-    const normalize = (value) => stripSourceSuffix(String(value || "")).replace(/\s+/g, " ").trim().toLocaleLowerCase();
-    return Boolean(left && right && normalize(left) === normalize(right));
-  }
-
-  function notebookSourcesAreSelected(records) {
-    const selectedNames = new Set(records.map((record) => record._aiSourceControlName));
-    return selectedNames.size === records.length && getNotebookSourceControls().every((control) => control.checkbox.checked === selectedNames.has(control.name));
-  }
-
   async function submitNotebookAiTranslationPrompt() {
-    const input = findNotebookChatInput();
-    const chatPanel = findNotebookChatPanel(input);
+    const input = NotebookDom.findChatInput(document, state.root);
+    const chatPanel = NotebookDom.findChatPanel(input, document);
     if (!input) throw new Error("未找到 NotebookLM 对话输入框，请确认笔记本页面已加载完成后重试。");
-    const knownPayloads = new Set(getNotebookAiResponseTexts(chatPanel || document)
-      .flatMap((text) => extractJsonArrayCandidates(text).map((item) => item.raw)));
-    const prompt = buildAiTranslationPrompt();
+    const knownPayloads = new Set(NotebookDom.getAiResponseTexts(chatPanel || document)
+      .flatMap((text) => AiTranslationUtils.extractJsonArrayCandidates(text).map((item) => item.raw)));
+    const prompt = AiTranslationUtils.buildTranslationPrompt();
     setNativeTextareaValue(input, prompt);
     input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: prompt }));
     input.dispatchEvent(new Event("change", { bubbles: true }));
 
     const ready = await waitForCondition(() => {
-      const submit = findNotebookChatSubmit(input, chatPanel);
+      const submit = NotebookDom.findChatSubmit(input, chatPanel, document, state.root);
       return Boolean(submit && !submit.disabled);
     }, 6000, 100);
     if (!ready) throw new Error("NotebookLM 未能启用发送按钮，请确认页面已加载完成。");
-    const submit = findNotebookChatSubmit(input, chatPanel);
+    const submit = NotebookDom.findChatSubmit(input, chatPanel, document, state.root);
     if (!submit) throw new Error("未找到 NotebookLM 对话发送按钮，请刷新页面后重试。");
     submit.click();
     return waitForNotebookAiJson(chatPanel || document, knownPayloads);
-  }
-
-  function findNotebookChatInput() {
-    const chatPanel = document.querySelector(".chat-panel");
-    const scopedCandidates = chatPanel
-      ? Array.from(chatPanel.querySelectorAll("textarea"))
-      : [];
-    const knownLabels = [
-      "查询框",
-      "查詢方塊",
-      "Query box"
-    ];
-    const labelledCandidates = knownLabels.flatMap((label) =>
-      Array.from(document.querySelectorAll(`textarea[aria-label="${label}"]`)));
-    const structuralCandidates = Array.from(document.querySelectorAll("textarea"))
-      .filter((textarea) => {
-        if (state.root && state.root.contains(textarea)) return false;
-        const form = textarea.closest("form");
-        return Boolean(form && form.querySelector('button[type="submit"]'));
-      });
-    return [...scopedCandidates, ...labelledCandidates, ...structuralCandidates]
-      .find(isUsableNotebookControl) || null;
-  }
-
-  function findNotebookChatPanel(input) {
-    return document.querySelector(".chat-panel") ||
-      (input && input.closest(".chat-panel")) ||
-      null;
-  }
-
-  function findNotebookChatSubmit(input, chatPanel) {
-    const scopes = [
-      input && input.closest("form"),
-      chatPanel
-    ].filter(Boolean);
-    for (const scope of scopes) {
-      const submit = Array.from(scope.querySelectorAll('button[type="submit"]'))
-        .find(isUsableNotebookControl);
-      if (submit) return submit;
-    }
-    return Array.from(document.querySelectorAll('button[type="submit"]'))
-      .filter((button) => !(state.root && state.root.contains(button)))
-      .find(isUsableNotebookControl) || null;
-  }
-
-  function isUsableNotebookControl(element) {
-    if (!element || element.disabled || element.hidden) return false;
-    if (element.getAttribute("aria-hidden") === "true") return false;
-    const style = window.getComputedStyle(element);
-    return style.display !== "none" && style.visibility !== "hidden";
-  }
-
-  function buildAiTranslationPrompt() {
-    return [
-      "请将当前选中的全部来源分别完整翻译成中文。",
-      "不得概括、删减、合并来源。",
-      "请仅输出合法 JSON 数组，不要使用 Markdown 代码块，不要解释。",
-      "格式必须完全为：",
-      '[{"source_name":"来源名","zh":"完整中文翻译"}]'
-    ].join("\n");
   }
 
   function setNativeTextareaValue(textarea, value) {
@@ -1059,10 +951,10 @@
     let stableRaw = "";
     let stableSince = 0;
     while (Date.now() < deadline) {
-      const candidates = getNotebookAiResponseTexts(chatPanel)
-        .flatMap((text) => extractJsonArrayCandidates(text))
+      const candidates = NotebookDom.getAiResponseTexts(chatPanel)
+        .flatMap((text) => AiTranslationUtils.extractJsonArrayCandidates(text))
         .filter((item) => !knownPayloads.has(item.raw))
-        .filter((item) => item.value.some((row) => row && typeof row === "object" && typeof row.source_name === "string" && typeof row.zh === "string" && row.zh.trim() && row.zh.trim() !== "完整中文翻译"));
+        .filter((item) => item.value.some((row) => row && typeof row === "object" && typeof row.source_name === "string" && typeof row.zh === "string" && row.zh.trim() && !["完整中文翻译", "完整简体中文翻译"].includes(row.zh.trim())));
       const newest = candidates[candidates.length - 1];
       if (newest) {
         if (newest.raw !== stableRaw) {
@@ -1075,77 +967,6 @@
       await wait(AI_TRANSLATION_POLL_MS);
     }
     throw new Error("等待 NotebookLM AI 翻译超时，未收到完整 JSON 结果。");
-  }
-
-  function getNotebookAiResponseTexts(chatPanel) {
-    return Array.from(chatPanel.querySelectorAll(".to-user-message-inner-content"))
-      .map((message) => {
-        const content = message.querySelector(".message-text-content") || message;
-        const clone = content.cloneNode(true);
-        clone.querySelectorAll(".citation-marker").forEach((marker) => marker.remove());
-        return String(clone.textContent || "").trim();
-      })
-      .filter(Boolean);
-  }
-
-  function extractJsonArrayCandidates(text) {
-    const source = String(text || "");
-    const candidates = [];
-    for (let start = source.indexOf("["); start >= 0; start = source.indexOf("[", start + 1)) {
-      let depth = 0;
-      let quote = "";
-      let escaped = false;
-      for (let index = start; index < source.length; index += 1) {
-        const char = source[index];
-        if (quote) {
-          if (escaped) escaped = false;
-          else if (char === "\\") escaped = true;
-          else if (char === quote) quote = "";
-          continue;
-        }
-        if (char === '"') {
-          quote = char;
-          continue;
-        }
-        if (char === "[") depth += 1;
-        else if (char === "]") {
-          depth -= 1;
-          if (!depth) {
-            const raw = source.slice(start, index + 1);
-            try {
-              const value = JSON.parse(raw);
-              if (Array.isArray(value)) candidates.push({ raw, value });
-            } catch (_error) {
-              // Keep scanning: streamed answers are often incomplete before the final update.
-            }
-            break;
-          }
-        }
-      }
-    }
-    return candidates;
-  }
-
-  function mergeAiTranslationPayload(payload, records) {
-    const unmatchedRecords = records.slice();
-    const translated = [];
-    const unknown = [];
-    (Array.isArray(payload) ? payload : []).forEach((item) => {
-      if (!item || typeof item !== "object" || typeof item.source_name !== "string" || typeof item.zh !== "string" || !item.zh.trim()) {
-        unknown.push(item);
-        return;
-      }
-      const index = unmatchedRecords.findIndex((record) => sourceNamesMatch(item.source_name, record.sourceOriginalName || record.sourceName));
-      if (index < 0) {
-        unknown.push(item);
-        return;
-      }
-      const [record] = unmatchedRecords.splice(index, 1);
-      record.translation = item.zh.trim();
-      record.translationError = "";
-      translated.push(record);
-    });
-    return { translated, missing: unmatchedRecords, unknown };
   }
 
   function waitForCondition(check, timeoutMs, intervalMs) {
@@ -1393,12 +1214,7 @@
   }
 
   function stripSourceSuffix(sourceName) {
-    let value = String(sourceName || "").trim();
-    const queryIndex = value.indexOf("?");
-    if (queryIndex >= 0) value = value.slice(0, queryIndex);
-    const fragmentIndex = value.indexOf("#", 1);
-    if (fragmentIndex >= 0) value = value.slice(0, fragmentIndex);
-    return value.replace(/\.[a-z0-9]{1,10}$/i, "").trim();
+    return AiTranslationUtils.stripSourceSuffix(sourceName);
   }
 
   function validDeploymentUrl(value) {

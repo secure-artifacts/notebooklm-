@@ -2,9 +2,16 @@
 
 这是一个本地加载的 Chrome/Edge 扩展：把公开的 Google Drive 音视频批量加入当前 NotebookLM 笔记本，逐个读取来源转录稿，可选通过 NotebookLM AI 翻译为中文，并把结果登记到你的 Google Sheets 数据库服务。
 
-> 当前版本：[`v0.9.9`](https://github.com/secure-artifacts/notebooklm-/releases/tag/v0.9.9) · 下载并解压 Release 中的 ZIP 后，在浏览器扩展管理页使用「加载已解压的扩展程序」导入。
+> 当前版本：[`v0.10.0`](https://github.com/secure-artifacts/notebooklm-/releases/tag/v0.10.0) · 下载并解压 Release 中的 ZIP 后，在浏览器扩展管理页使用「加载已解压的扩展程序」导入。
 
 ## 最新更新
+
+### v0.10.0
+
+- 将 NotebookLM 页面 DOM 适配和 AI 翻译纯逻辑拆为独立模块，降低网站结构变化带来的维护风险。
+- 新增来源名匹配、AI JSON 解析、多语言对话框识别、来源选择与引用标记清理等 10 项单元测试。
+- GitHub Release 工作流会先运行单元测试，通过后才打包发布。
+- AI 翻译提示词明确要求使用中国大陆通用的简体中文，并禁止输出繁体字。
 
 ### v0.9.9
 
@@ -29,7 +36,7 @@
 - Drive 下载文件名支持 UTF-8 扩展参数、MIME 编码和常见 Latin-1 误解码修复，避免中文名称上传后变成乱码。
 - 顶部统计卡分别显示结果总计、成功和失败；复制及登记只包含成功取得转录的记录。
 - 提供“清空来源”按钮，可在二次确认后逐个移除当前笔记本中的全部来源；单条失败不会中断其他来源。
-- 可选「AI 翻译」，默认关闭。它使用当前已登录 NotebookLM 的 AI 对话能力替代谷歌翻译：临时只选中待翻译来源，每批最多 10 个，请 NotebookLM 返回严格 JSON 格式的完整中文翻译；不需要翻译 API Key。
+- 可选「AI 翻译」，默认关闭。它使用当前已登录 NotebookLM 的 AI 对话能力替代谷歌翻译：临时只选中待翻译来源，每批最多 10 个，请 NotebookLM 返回严格 JSON 格式的完整简体中文翻译；提示词明确禁止输出繁体字，不需要翻译 API Key。
 - AI 翻译会核验来源名与返回项；缺项只重试缺失来源，整批无效时自动拆为最多 5 个来源重试。来源处理失败、没有原文转录或已被移除时会自动跳过并保留失败原因。
 - 翻译关闭时复制两列表格，开启时复制三列表格到 Excel/Google Sheets；换行会保留在同一个单元格内。
 - 登记到 Google Sheets 后端时每批最多发送 `200` 条；多批请求会依次执行并累计总结果，单批请求失败不会阻止后续批次。
@@ -76,6 +83,25 @@ Content-Type: application/json
 5. 如需中文翻译，勾选「AI 翻译」；可在提取前或提取后勾选。开启后，导入批次会在自动移除来源前完成 AI 翻译；翻译失败的来源会保留以便重试。
 6. 需要写入时点击「登记表格」；需要手工粘贴时点击「复制」。
 
+## 项目结构与测试
+
+- `src/content.js`：扩展面板、导入与翻译流程编排。
+- `src/modules/notebook-dom.js`：NotebookLM 来源选择、对话输入框、发送按钮和 AI 回复的页面适配。
+- `src/modules/ai-translation-utils.js`：来源名标准化、提示词、JSON 解析与翻译结果合并。
+- `src/page-hook.js`：在 NotebookLM 页面主环境中调用来源相关请求。
+- `src/drive-loader.js`：公开 Drive 音视频下载与类型验证。
+- `tests/`：不访问网络的 Node.js 单元测试。
+
+本地检查：
+
+```bash
+node --test tests/*.test.js
+node --check src/content.js
+node --check src/page-hook.js
+```
+
+Release 工作流会先运行单元测试，测试通过后才打包扩展。新模块位于 `src/` 下，会自动包含在最终 ZIP 中。
+
 ## 隐私与限制
 
 - 只有用户点击「开始导入」后，扩展才会下载用户填写的公开 Drive 音视频，并在当前 NotebookLM 笔记本创建来源和上传文件；文件按顺序处理，单个文件最高 512 MB。
@@ -103,11 +129,11 @@ git push origin main
 
 #### 2. 创建并推送版本 Tag
 
-版本号使用 `v主版本.次版本.修订版本` 格式，例如 `v0.9.9`。
+版本号使用 `v主版本.次版本.修订版本` 格式，例如 `v0.10.0`。
 
 ```bash
-git tag -a v0.9.9 -m "Release version 0.9.9"
-git push origin v0.9.9
+git tag -a v0.10.0 -m "Release version 0.10.0"
+git push origin v0.10.0
 ```
 
 推送后，GitHub Actions 会自动：
@@ -129,8 +155,8 @@ git push origin v0.9.9
 3. 重新创建相同版本的 Tag 并推送：
 
 ```bash
-git tag -d v0.9.9
-git push origin :refs/tags/v0.9.9
-git tag -a v0.9.9 -m "Release version 0.9.9"
-git push origin v0.9.9
+git tag -d v0.10.0
+git push origin :refs/tags/v0.10.0
+git tag -a v0.10.0 -m "Release version 0.10.0"
+git push origin v0.10.0
 ```
