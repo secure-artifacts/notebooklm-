@@ -1,0 +1,2201 @@
+import {
+  buildTranslationPrompt,
+  extractJsonArrayCandidates,
+  mergeTranslationPayload,
+  sourceNamesMatch,
+  stripSourceSuffix
+} from "@/lib/aiTranslation";
+import {
+  formatBytes,
+  formatDuration,
+  isRetryableNetworkError as isRetryableDriveError,
+  mapConcurrent,
+  normalizeBatchSize,
+  parseDriveUrls
+} from "@/lib/driveImport";
+import { completedSourceIdsForCleanup } from "@/lib/importCleanup";
+import { parseFacebookClipboardRows, parseFacebookTableRows } from "@/lib/colabProvider";
+import {
+  FACEBOOK_BATCH_SIZE,
+  FACEBOOK_MAX_TASKS,
+  NOTEBOOK_SOURCE_LIMIT,
+  RESULT_RENDER_LIMIT,
+  createFacebookJob,
+  facebookTaskFingerprint,
+  nextFacebookBatch,
+  removeFacebookJobTasks,
+  retainedSourceCapacity
+} from "@/lib/facebookQueue";
+import {
+  addStatusCount,
+  analyzeBatchResponse,
+  formatStatusCounts,
+  mergeStatusCounts,
+  toSheetRecords,
+  validDatabaseUrl,
+  validDeploymentUrl
+} from "@/lib/sheetRegistration";
+import {
+  captureSourceSelection,
+  findChatInput,
+  findChatPanel,
+  findChatSubmit,
+  getAiResponseTexts,
+  restoreSourceSelection,
+  selectSourcesForRecordsWhenReady,
+  sourcesAreSelected
+} from "@/lib/notebookDom";
+import type { LogEntry, TranscriptRecord } from "@/types/domain";
+import type { FacebookBulkJob } from "@/types/facebookJob";
+import type {
+  ExtensionResources,
+  PanelLayout,
+  PanelSettings
+} from "@/types/messages";
+import { extensionClient } from "@/scopes/content/extensionClient";
+import { FacebookImportCoordinator } from "@/scopes/content/facebookCoordinator";
+import { callNotebookPageApi } from "@/scopes/content/notebookClient";
+import type { NotebookAction } from "./apiClient";
+
+  const APP_ID = "nlm-video-translation-helper";
+  const API_TIMEOUT_MS = 10 * 60 * 1000;
+  const MEDIA_UPLOAD_TIMEOUT_MS = 30 * 60 * 1000;
+  const BATCH_EXTRACTION_TIMEOUT_MS = 30 * 60 * 1000;
+  const PAGE_RESPONSE_GRACE_MS = 15 * 1000;
+  const DRIVE_DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
+  const DEFAULT_DRIVE_BATCH_SIZE = 10;
+  const MIN_DRIVE_BATCH_SIZE = 1;
+  const MAX_DRIVE_BATCH_SIZE = 25;
+  const DRIVE_PIPELINE_CONCURRENCY = 3;
+  const DRIVE_DOWNLOAD_MAX_ATTEMPTS = 3;
+  const DRIVE_RETRY_BASE_DELAY_MS = 1000;
+  const SHEET_REGISTRATION_BATCH_SIZE = 200;
+  const AI_TRANSLATION_BATCH_SIZE = 10;
+  const AI_TRANSLATION_TIMEOUT_MS = 5 * 60 * 1000;
+  const AI_TRANSLATION_RETRY_LIMIT = 1;
+  const AI_TRANSLATION_SPLIT_SIZE = 5;
+  const AI_TRANSLATION_POLL_MS = 500;
+  const AI_TRANSLATION_SETTLE_MS = 1400;
+  const MAX_LOGS = 240;
+  const DRIVE_BRIDGE_TOKEN = typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+  type AppState = {
+    records: TranscriptRecord[];
+    isBusy: boolean;
+    translateEnabled: boolean;
+    autoDeleteImported: boolean;
+    autoRegisterImported: boolean;
+    driveBatchSize: number;
+    importMode: "drive" | "facebook";
+    facebookRows: FacebookInputRow[];
+    facebookActive: boolean;
+    databaseUrl: string;
+    minimized: boolean;
+    bottomOpen: boolean;
+    bottomView: "results" | "logs";
+    driveActivity: { download: string; upload: string };
+    panelLayout: PanelLayout;
+    suppressClick: boolean;
+    stage: string;
+    logs: LogEntry[];
+    root: HTMLElement;
+  };
+
+  type FacebookInputRow = {
+    key: number;
+    postId: string;
+    url: string;
+    status: string;
+    statusKind: "idle" | "working" | "success" | "error";
+    selected: boolean;
+    persistedTaskId?: string;
+  };
+
+  type PendingDriveDownload = {
+    resolve: (file: File) => void;
+    reject: (error: Error) => void;
+    timeoutId: number;
+    position: string;
+    receivedBytes: number;
+    totalBytes: number;
+  };
+
+  const state: AppState = {
+    records: [],
+    isBusy: false,
+    translateEnabled: false,
+    autoDeleteImported: true,
+    autoRegisterImported: false,
+    driveBatchSize: DEFAULT_DRIVE_BATCH_SIZE,
+    importMode: "drive",
+    facebookRows: [],
+    facebookActive: false,
+    databaseUrl: "",
+    minimized: false,
+    bottomOpen: true,
+    bottomView: "results",
+    driveActivity: { download: "", upload: "" },
+    panelLayout: {},
+    suppressClick: false,
+    stage: "准备就绪",
+    logs: [],
+    root: null!
+  };
+  let extensionResources: ExtensionResources = {
+    driveLoaderUrl: "",
+    iconUrl: "",
+    extensionOrigin: ""
+  };
+  const pendingDriveDownloads = new Map<string, PendingDriveDownload>();
+  const activeDriveUploads = new Map<string, { position: string; fileName: string }>();
+  let driveLoaderFrame: HTMLIFrameElement = null!;
+  let driveLoaderReady: Promise<void> | null = null;
+  let initialized = false;
+  let activeNotebookId = "";
+  let routeTimerId = 0;
+  let facebookCoordinator: FacebookImportCoordinator | null = null;
+  let facebookJob: FacebookBulkJob | null = null;
+  let facebookPauseRequested = false;
+  let facebookRowSequence = 0;
+  type FacebookCellColumn = "postId" | "url";
+  type FacebookCellPosition = { rowKey: number; column: FacebookCellColumn };
+  let facebookCellAnchor: FacebookCellPosition | null = null;
+  let facebookCellFocus: FacebookCellPosition | null = null;
+  let facebookCellDragging = false;
+
+export function bootNotebookApp(): void {
+  boot();
+}
+
+  function panelQuery<T extends Element = HTMLElement>(selector: string): T {
+    const element = state.root.querySelector<T>(selector);
+    if (!element) throw new Error(`插件面板缺少必要控件：${selector}`);
+    return element;
+  }
+
+  function boot() {
+    window.addEventListener("message", handleDriveLoaderMessage);
+    window.addEventListener("resize", keepPanelInViewport);
+    document.addEventListener("DOMContentLoaded", start);
+    if (document.readyState !== "loading") start();
+  }
+
+  async function start() {
+    if (initialized) return;
+    initialized = true;
+    syncNotebookRoute();
+    routeTimerId = window.setInterval(syncNotebookRoute, 700);
+    try {
+      await initialize();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStage("扩展后台连接失败，请重新加载扩展");
+      addLog(`后台连接失败：${message || "未返回具体原因"}。请在扩展管理页确认加载的是 dist 目录，然后重新加载扩展。`, "错误");
+      console.error("NotebookLM 助手初始化失败", error);
+    }
+  }
+
+  async function initialize() {
+    const [saved, resources] = await Promise.all([
+      extensionClient.getSettings(),
+      Promise.resolve(extensionClient.getExtensionResources())
+    ]);
+    extensionResources = resources;
+    const panelSettings = saved.panel;
+    state.translateEnabled = panelSettings.aiTranslationEnabled === true;
+    state.autoDeleteImported = panelSettings.autoDeleteImported !== false;
+    state.autoRegisterImported = panelSettings.autoRegisterImported === true || panelSettings.facebookAutoRegister === true;
+    state.driveBatchSize = normalizeDriveBatchSize(panelSettings.driveBatchSize);
+    state.importMode = panelSettings.importMode === "facebook" || panelSettings.facebookImportOpen === true ? "facebook" : "drive";
+    state.databaseUrl = String(saved.databaseUrl || "");
+    state.minimized = Boolean(panelSettings.minimized);
+    state.panelLayout = panelSettings.layout || null;
+    syncNotebookRoute();
+    if (state.root) {
+      panelQuery<HTMLInputElement>("[data-role='database-url']").value = state.databaseUrl;
+      state.root.querySelectorAll<HTMLImageElement>("img[data-extension-icon]").forEach((icon) => {
+        icon.src = extensionResources.iconUrl || fallbackIconDataUrl();
+      });
+      restorePanelLayout();
+      render();
+    }
+    await restoreFacebookJob();
+    addLog("已就绪，等待提取来源。", "系统");
+  }
+
+  function getNotebookId() {
+    const match = window.location.pathname.match(/^\/notebook\/([0-9a-f-]+)\/?$/i);
+    return match ? match[1] : "";
+  }
+
+  function syncNotebookRoute() {
+    const notebookId = getNotebookId();
+    if (!notebookId) {
+      if (activeNotebookId) resetNotebookSession();
+      activeNotebookId = "";
+      if (state.root) {
+        state.root.remove();
+        state.root = null!;
+      }
+      return;
+    }
+
+    const notebookChanged = Boolean(activeNotebookId && activeNotebookId !== notebookId);
+    if (notebookChanged) {
+      resetNotebookSession();
+    }
+    activeNotebookId = notebookId;
+    if (!state.root || !state.root.isConnected) createPanel();
+    if (notebookChanged) void restoreFacebookJob();
+  }
+
+  function resetNotebookSession() {
+    pendingDriveDownloads.forEach((pending) => {
+      clearTimeout(pending.timeoutId);
+      pending.reject(new Error("已切换笔记本，当前下载已取消。"));
+    });
+    pendingDriveDownloads.clear();
+    void facebookCoordinator?.cancel();
+    facebookCoordinator = null;
+    facebookJob = null;
+    facebookPauseRequested = true;
+    state.facebookActive = false;
+    activeDriveUploads.clear();
+    if (driveLoaderFrame) driveLoaderFrame.remove();
+    driveLoaderFrame = null!;
+    driveLoaderReady = null;
+    state.records = [];
+    state.logs = [];
+    state.isBusy = false;
+    state.driveActivity = { download: "", upload: "" };
+    state.stage = "已切换笔记本";
+  }
+
+  function createPanel() {
+    if (document.getElementById(APP_ID)) return;
+    ensureFacebookEditorRows();
+    const root = document.createElement("section");
+    root.id = APP_ID;
+    root.className = "nlm-register-panel";
+    root.innerHTML = `
+      <header class="nlm-register-header">
+        <div class="nlm-brand">
+          ${brandIconMarkup("nlm-brand-mark")}
+          <div><strong>转录登记</strong><span>NotebookLM 助手</span></div>
+        </div>
+        <div class="nlm-header-actions">
+          <label class="nlm-translate-toggle"><input type="checkbox" data-role="translate-toggle"><span>AI 翻译</span></label>
+          <button type="button" class="nlm-minimize" data-action="minimize" aria-label="最小化" title="最小化">−</button>
+        </div>
+      </header>
+      <main>
+        <section class="nlm-fixed-section">
+          <div class="nlm-top-alert" data-role="top-alert" role="alert" aria-live="assertive" hidden></div>
+          <label class="nlm-sheet-config">
+            <span><b>登记表格</b><small data-role="sheet-save-state">自动缓存</small></span>
+            <input type="url" data-role="database-url" placeholder="粘贴含 gid 的 Google 表格链接">
+          </label>
+          <section class="nlm-import-workspace">
+            <nav class="nlm-import-tabs" role="tablist" aria-label="导入方式">
+              <button type="button" data-action="switch-import" data-mode="drive" role="tab"><b>Google Drive</b><span>公开音视频链接</span></button>
+              <button type="button" data-action="switch-import" data-mode="facebook" role="tab"><b>Facebook</b><span>Colab 批量导入</span></button>
+            </nav>
+            <section class="nlm-import-pane" data-role="drive-pane" role="tabpanel">
+              <textarea data-role="drive-urls" rows="3" spellcheck="false" placeholder="每行粘贴一个公开的 Google Drive 文件链接"></textarea>
+              <div class="nlm-import-pane-actions">
+                <small>公开链接，无需 Drive 授权</small>
+                <label class="nlm-batch-size"><span>每批</span><input type="number" data-role="drive-batch-size" min="1" max="25" step="1" inputmode="numeric"><span>个</span></label>
+                <button type="button" data-action="import-drive">开始导入</button>
+              </div>
+            </section>
+            <section class="nlm-import-pane" data-role="facebook-pane" role="tabpanel">
+              <div class="nlm-facebook-table-toolbar">
+                <label><input type="checkbox" data-role="facebook-select-all"><span>全选</span></label>
+                <span data-role="facebook-row-count">0 条</span>
+                <button type="button" data-action="facebook-add-row">＋ 添加行</button>
+                <button type="button" data-action="facebook-delete-selected">删除选中</button>
+                <button type="button" class="nlm-facebook-start" data-action="import-facebook">开始导入</button>
+              </div>
+              <div class="nlm-facebook-grid" role="grid" aria-label="Facebook 导入任务表">
+                <div class="nlm-facebook-grid-head" role="row"><span></span><b>贴文 ID</b><b>Facebook 链接</b><b>状态</b></div>
+                <div class="nlm-facebook-grid-body" data-role="facebook-grid-body"></div>
+              </div>
+              <div class="nlm-facebook-table-footer">
+                <p class="nlm-facebook-paste-tip">像表格一样拖选、复制、粘贴两列；最多 1000 条，每批 20 条。</p>
+                <button type="button" class="nlm-facebook-cancel" data-action="cancel-facebook" hidden>暂停</button>
+              </div>
+            </section>
+          </section>
+          <section class="nlm-import-options" aria-label="公共导入设置">
+            <label><input type="checkbox" data-role="auto-delete-toggle"><span><b>自动移除来源</b><small>完成后释放名额</small></span></label>
+            <label><input type="checkbox" data-role="auto-register-toggle"><span><b>自动登记表格</b><small>每批完成后写入</small></span></label>
+          </section>
+          <div class="nlm-count-card">
+            <div class="nlm-count-stat is-total"><b data-role="record-count">0</b><span>总计</span></div>
+            <div class="nlm-count-stat is-success"><b data-role="success-count">0</b><span>成功</span></div>
+            <div class="nlm-count-stat is-failed"><b data-role="failed-count">0</b><span>失败</span></div>
+            <small>仅成功记录可复制和登记</small>
+          </div>
+          <div class="nlm-result-actions">
+            <button type="button" data-action="copy"><span>复制结果</span><small>粘贴到表格</small></button>
+            <button type="button" data-action="register"><span>登记表格</span><small>写入 Google Sheets</small></button>
+          </div>
+          <div class="nlm-extract-actions">
+            <button type="button" data-action="extract">提取现有来源</button>
+            <button type="button" data-action="clear-records">清除提取记录</button>
+            <button type="button" data-action="delete-all-sources">清空左侧来源</button>
+            <span data-role="status">准备就绪</span>
+          </div>
+        </section>
+        <section class="nlm-bottom-panel is-open">
+          <div class="nlm-bottom-bar">
+            <div class="nlm-bottom-tabs" role="tablist" aria-label="结果与日志">
+              <button type="button" data-action="show-results" role="tab"><span>转录结果</span><b data-role="result-tab-count">0</b></button>
+              <button type="button" data-action="show-logs" role="tab"><span>操作日志</span><b data-role="log-tab-count">0</b></button>
+            </div>
+            <button type="button" class="nlm-bottom-toggle" data-action="toggle-bottom" aria-label="折叠底部面板" title="折叠底部面板">⌄</button>
+          </div>
+          <div class="nlm-bottom-content">
+            <section class="nlm-bottom-view" data-role="results-view" role="tabpanel">
+              <div class="nlm-view-toolbar"><span>本次页面会话内跳过已提取来源</span></div>
+              <div class="nlm-results-scroll" data-role="results"></div>
+            </section>
+            <section class="nlm-bottom-view" data-role="logs-view" role="tabpanel">
+              <div class="nlm-log-list" data-role="logs"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+      <button type="button" class="nlm-orb" data-action="minimize" aria-label="展开转录登记" title="展开转录登记">${brandIconMarkup("nlm-orb-mark")}</button>`;
+    document.documentElement.appendChild(root);
+    state.root = root;
+    panelQuery<HTMLInputElement>("[data-role='database-url']").value = state.databaseUrl;
+    restorePanelLayout();
+    bindPanel();
+    renderFacebookTable();
+    render();
+  }
+
+  function bindPanel() {
+    panelQuery<HTMLInputElement>("[data-role='translate-toggle']").addEventListener("change", async (event) => {
+      state.translateEnabled = (event.currentTarget as HTMLInputElement).checked;
+      render();
+      await savePanelSettings();
+      if (state.translateEnabled && state.records.some((record) => record.transcript && !record.translation && !record.error)) {
+        await translateExistingRecords();
+      } else {
+        setStage(state.translateEnabled ? "AI 翻译已开启" : "AI 翻译已关闭");
+      }
+    });
+    panelQuery<HTMLInputElement>("[data-role='auto-delete-toggle']").addEventListener("change", async (event) => {
+      state.autoDeleteImported = (event.currentTarget as HTMLInputElement).checked;
+      setStage(state.autoDeleteImported ? "自动移除已开启" : "自动移除已关闭");
+      render();
+      await savePanelSettings();
+    });
+    panelQuery<HTMLInputElement>("[data-role='auto-register-toggle']").addEventListener("change", async (event) => {
+      state.autoRegisterImported = (event.currentTarget as HTMLInputElement).checked;
+      setStage(state.autoRegisterImported ? "每批自动登记已开启" : "自动登记已关闭");
+      render();
+      await savePanelSettings();
+    });
+    panelQuery<HTMLInputElement>("[data-role='drive-batch-size']").addEventListener("change", async (event) => {
+      const input = event.currentTarget as HTMLInputElement;
+      state.driveBatchSize = normalizeDriveBatchSize(input.value);
+      input.value = String(state.driveBatchSize);
+      setStage(`Drive 每批处理 ${state.driveBatchSize} 个文件`);
+      await savePanelSettings();
+    });
+    const facebookGrid = panelQuery<HTMLElement>("[data-role='facebook-grid-body']");
+    facebookGrid.addEventListener("input", handleFacebookGridInput);
+    facebookGrid.addEventListener("change", handleFacebookGridChange);
+    facebookGrid.addEventListener("paste", handleFacebookGridPaste);
+    facebookGrid.addEventListener("mousedown", handleFacebookCellMouseDown);
+    facebookGrid.addEventListener("mouseover", handleFacebookCellMouseOver);
+    facebookGrid.addEventListener("keydown", handleFacebookGridKeyDown);
+    panelQuery<HTMLInputElement>("[data-role='facebook-select-all']").addEventListener("change", (event) => {
+      const checked = (event.currentTarget as HTMLInputElement).checked;
+      state.facebookRows.forEach((row) => { row.selected = checked; });
+      renderFacebookTable();
+    });
+    state.root.addEventListener("click", (event) => {
+      const button = (event.target as Element).closest<HTMLButtonElement>("button[data-action]");
+      if (!button) return;
+      if (state.suppressClick) {
+        state.suppressClick = false;
+        event.preventDefault();
+        return;
+      }
+      if (button.dataset.action === "minimize") {
+        toggleMinimized();
+        return;
+      }
+      if (button.dataset.action === "switch-import") {
+        state.importMode = button.dataset.mode === "facebook" ? "facebook" : "drive";
+        render();
+        void savePanelSettings();
+        return;
+      }
+      if (button.dataset.action === "facebook-add-row") {
+        if (state.facebookRows.length < FACEBOOK_MAX_TASKS) state.facebookRows.push(createFacebookInputRow());
+        renderFacebookTable();
+        return;
+      }
+      if (button.dataset.action === "facebook-delete-selected") {
+        void deleteSelectedFacebookRows();
+        return;
+      }
+      if (button.dataset.action === "show-results") return switchBottomView("results");
+      if (button.dataset.action === "show-logs") return switchBottomView("logs");
+      if (button.dataset.action === "toggle-bottom") return toggleBottomPanel();
+      if (button.dataset.action === "clear-records") {
+        if (!state.isBusy) clearRecords();
+        return;
+      }
+      if (button.dataset.action === "cancel-facebook") {
+        if (state.facebookActive) {
+          facebookPauseRequested = true;
+          setStage("将在当前批次完成后暂停…");
+          addLog("已请求暂停；为避免重复来源，将在当前批次完成并保存检查点后暂停。", "暂停");
+          render();
+        }
+        return;
+      }
+      if (state.isBusy) return;
+      if (button.dataset.action === "extract") extractAllSources();
+      if (button.dataset.action === "import-drive") importDriveMedia();
+      if (button.dataset.action === "import-facebook") importFacebookMedia();
+      if (button.dataset.action === "delete-all-sources") deleteAllSources();
+      if (button.dataset.action === "register") registerToSheet();
+      if (button.dataset.action === "copy") copyTable();
+    });
+    bindPanelDrag();
+    bindPanelResizePersistence();
+    bindDatabaseUrlInput();
+  }
+
+  function createFacebookInputRow(postId = "", url = "", status = "待填写"): FacebookInputRow {
+    facebookRowSequence += 1;
+    return { key: facebookRowSequence, postId, url, status, statusKind: "idle", selected: false };
+  }
+
+  function ensureFacebookEditorRows(minimum = 5) {
+    while (state.facebookRows.length < minimum && state.facebookRows.length < FACEBOOK_MAX_TASKS) {
+      state.facebookRows.push(createFacebookInputRow());
+    }
+  }
+
+  function handleFacebookGridInput(event: Event) {
+    const input = (event.target as Element).closest<HTMLInputElement>("input[data-facebook-field]");
+    if (!input) return;
+    const row = state.facebookRows.find((item) => item.key === Number(input.dataset.rowKey));
+    if (!row) return;
+    if (input.dataset.facebookField === "postId") row.postId = input.value;
+    if (input.dataset.facebookField === "url") row.url = input.value;
+    row.status = row.postId.trim() || row.url.trim() ? "待校验" : "待填写";
+    row.statusKind = "idle";
+  }
+
+  function handleFacebookGridChange(event: Event) {
+    const checkbox = (event.target as Element).closest<HTMLInputElement>("input[data-facebook-select]");
+    if (checkbox) {
+      const row = state.facebookRows.find((item) => item.key === Number(checkbox.dataset.rowKey));
+      if (row) row.selected = checkbox.checked;
+      renderFacebookTable();
+      return;
+    }
+    if ((event.target as Element).matches("input[data-facebook-field]")) renderFacebookTable();
+  }
+
+  function handleFacebookGridPaste(event: ClipboardEvent) {
+    const input = (event.target as Element).closest<HTMLInputElement>("input[data-facebook-field]");
+    if (!input) return;
+    const text = event.clipboardData?.getData("text/plain") || "";
+    if (!text.includes("\t") && !/[\r\n]/u.test(text)) return;
+    const pasted = parseFacebookClipboardRows(text);
+    if (!pasted.length) return;
+    event.preventDefault();
+    const startIndex = state.facebookRows.findIndex((row) => row.key === Number(input.dataset.rowKey));
+    if (startIndex < 0) return;
+    const available = FACEBOOK_MAX_TASKS - startIndex;
+    pasted.slice(0, available).forEach((cells, offset) => {
+      const targetIndex = startIndex + offset;
+      while (state.facebookRows.length <= targetIndex) state.facebookRows.push(createFacebookInputRow());
+      const row = state.facebookRows[targetIndex];
+      if (cells.twoColumns) {
+        row.postId = cells.postId;
+        row.url = cells.url;
+      } else if (input.dataset.facebookField === "url") {
+        row.url = cells.url || cells.postId;
+      } else {
+        row.postId = cells.postId;
+      }
+      row.status = "待校验";
+      row.statusKind = "idle";
+    });
+    renderFacebookTable();
+    const accepted = Math.min(pasted.length, available);
+    setStage(pasted.length > accepted
+      ? `已粘贴 ${accepted} 行；另有 ${pasted.length - accepted} 行超过 1000 条上限`
+      : `已粘贴 ${accepted} 行 Facebook 数据`);
+  }
+
+  function facebookCellPosition(input: HTMLInputElement): FacebookCellPosition | null {
+    const column = input.dataset.facebookField;
+    if (column !== "postId" && column !== "url") return null;
+    const rowKey = Number(input.dataset.rowKey);
+    return Number.isFinite(rowKey) ? { rowKey, column } : null;
+  }
+
+  function handleFacebookCellMouseDown(event: MouseEvent) {
+    const input = (event.target as Element).closest<HTMLInputElement>("input[data-facebook-field]");
+    if (!input) return;
+    const position = facebookCellPosition(input);
+    if (!position) return;
+    if (!event.shiftKey || !facebookCellAnchor) facebookCellAnchor = position;
+    facebookCellFocus = position;
+    facebookCellDragging = true;
+    document.addEventListener("mouseup", handleFacebookCellMouseUp, { once: true });
+    updateFacebookCellSelectionDom();
+  }
+
+  function handleFacebookCellMouseUp() {
+    facebookCellDragging = false;
+  }
+
+  function handleFacebookCellMouseOver(event: MouseEvent) {
+    if (!facebookCellDragging || !(event.buttons & 1)) return;
+    const input = (event.target as Element).closest<HTMLInputElement>("input[data-facebook-field]");
+    if (!input) return;
+    const position = facebookCellPosition(input);
+    if (!position) return;
+    facebookCellFocus = position;
+    updateFacebookCellSelectionDom();
+  }
+
+  function getFacebookSelectionBounds() {
+    if (!facebookCellAnchor || !facebookCellFocus) return null;
+    const anchorRow = state.facebookRows.findIndex((row) => row.key === facebookCellAnchor!.rowKey);
+    const focusRow = state.facebookRows.findIndex((row) => row.key === facebookCellFocus!.rowKey);
+    if (anchorRow < 0 || focusRow < 0) return null;
+    const columns: FacebookCellColumn[] = ["postId", "url"];
+    const anchorColumn = columns.indexOf(facebookCellAnchor.column);
+    const focusColumn = columns.indexOf(facebookCellFocus.column);
+    return {
+      rowStart: Math.min(anchorRow, focusRow),
+      rowEnd: Math.max(anchorRow, focusRow),
+      columnStart: Math.min(anchorColumn, focusColumn),
+      columnEnd: Math.max(anchorColumn, focusColumn),
+      columns
+    };
+  }
+
+  function updateFacebookCellSelectionDom() {
+    const bounds = getFacebookSelectionBounds();
+    state.root?.querySelectorAll<HTMLInputElement>("input[data-facebook-field]").forEach((input) => {
+      const rowIndex = state.facebookRows.findIndex((row) => row.key === Number(input.dataset.rowKey));
+      const columnIndex = bounds?.columns.indexOf(input.dataset.facebookField as FacebookCellColumn) ?? -1;
+      input.classList.toggle("is-cell-selected", Boolean(bounds
+        && rowIndex >= bounds.rowStart && rowIndex <= bounds.rowEnd
+        && columnIndex >= bounds.columnStart && columnIndex <= bounds.columnEnd));
+    });
+  }
+
+  async function handleFacebookGridKeyDown(event: KeyboardEvent) {
+    const bounds = getFacebookSelectionBounds();
+    if (!bounds) return;
+    const cellCount = (bounds.rowEnd - bounds.rowStart + 1) * (bounds.columnEnd - bounds.columnStart + 1);
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c" && cellCount > 1) {
+      event.preventDefault();
+      const text = state.facebookRows.slice(bounds.rowStart, bounds.rowEnd + 1).map((row) => (
+        bounds.columns.slice(bounds.columnStart, bounds.columnEnd + 1)
+          .map((column) => row[column])
+          .join("\t")
+      )).join("\n");
+      try {
+        await navigator.clipboard.writeText(text);
+        setStage(`已复制 ${cellCount} 个 Facebook 表格单元格`);
+      } catch {
+        setStage("复制失败，请允许网页访问剪贴板后重试");
+      }
+      return;
+    }
+    if ((event.key === "Delete" || event.key === "Backspace") && cellCount > 1 && !state.isBusy) {
+      event.preventDefault();
+      state.facebookRows.slice(bounds.rowStart, bounds.rowEnd + 1).forEach((row) => {
+        bounds.columns.slice(bounds.columnStart, bounds.columnEnd + 1).forEach((column) => { row[column] = ""; });
+        row.status = row.postId.trim() || row.url.trim() ? "待校验" : "待填写";
+        row.statusKind = "idle";
+      });
+      renderFacebookTable();
+      setStage(`已清空 ${cellCount} 个 Facebook 表格单元格`);
+    }
+  }
+
+  async function deleteSelectedFacebookRows() {
+    const selectedRows = state.facebookRows.filter((row) => row.selected);
+    if (!selectedRows.length) return setStage("请先勾选要删除的 Facebook 行");
+    if (facebookJob?.activeSourceIds.length) {
+      setStage("队列仍有中断批次来源，请先继续队列完成清理后再删除任务");
+      return;
+    }
+    if (facebookJob) {
+      const selectedTaskIds = new Set(selectedRows.map((row) => row.persistedTaskId).filter(Boolean) as string[]);
+      const selectedKeys = new Set(selectedRows.map((row) => `${stripSourceSuffix(row.postId)}\n${row.url.trim()}`));
+      facebookJob.tasks.forEach((task) => {
+        if (selectedKeys.has(`${stripSourceSuffix(task.postId)}\n${task.url.trim()}`)) selectedTaskIds.add(task.taskId);
+      });
+      if (selectedTaskIds.size) {
+        const updatedJob = removeFacebookJobTasks(facebookJob, selectedTaskIds);
+        try {
+          await extensionClient.saveFacebookJob(updatedJob);
+          facebookJob = updatedJob;
+        } catch (error) {
+          setStage("删除失败：无法更新 Facebook 队列缓存，请重试");
+          addLog(error instanceof Error ? error.message : String(error), "队列缓存");
+          return;
+        }
+      }
+    }
+    state.facebookRows = state.facebookRows.filter((row) => !row.selected);
+    ensureFacebookEditorRows();
+    facebookCellAnchor = null;
+    facebookCellFocus = null;
+    renderFacebookTable();
+    const populated = selectedRows.filter((row) => row.postId.trim() || row.url.trim()).length;
+    setStage(`已删除 ${populated || selectedRows.length} 行，并同步更新队列缓存`);
+  }
+
+  function renderFacebookTable() {
+    if (!state.root) return;
+    ensureFacebookEditorRows();
+    const parsed = parseFacebookTableRows(state.facebookRows, FACEBOOK_MAX_TASKS);
+    const issues = new Map(parsed.issues.map((issue) => [issue.index, issue.message]));
+    const body = panelQuery<HTMLElement>("[data-role='facebook-grid-body']");
+    body.innerHTML = state.facebookRows.map((row, index) => {
+      const issue = issues.get(index);
+      const status = issue || row.status;
+      const kind = issue ? "error" : row.statusKind;
+      return `<div class="nlm-facebook-grid-row ${row.selected ? "is-selected" : ""} ${issue ? "has-error" : ""}" role="row" data-row-key="${row.key}">
+        <label><input type="checkbox" data-facebook-select data-row-key="${row.key}" ${row.selected ? "checked" : ""} ${state.isBusy ? "disabled" : ""} aria-label="选择第 ${index + 1} 行"></label>
+        <input type="text" data-facebook-field="postId" data-row-key="${row.key}" value="${escapeHtml(row.postId)}" placeholder="贴文 ID" spellcheck="false" ${state.isBusy ? "disabled" : ""}>
+        <input type="url" data-facebook-field="url" data-row-key="${row.key}" value="${escapeHtml(row.url)}" placeholder="https://facebook.com/..." spellcheck="false" ${state.isBusy ? "disabled" : ""}>
+        <span class="nlm-facebook-row-status is-${kind}" title="${escapeHtml(status)}">${escapeHtml(status)}</span>
+      </div>`;
+    }).join("");
+    const populated = state.facebookRows.filter((row) => row.postId.trim() || row.url.trim()).length;
+    panelQuery("[data-role='facebook-row-count']").textContent = `${populated} 条`;
+    const selectAll = panelQuery<HTMLInputElement>("[data-role='facebook-select-all']");
+    selectAll.checked = Boolean(state.facebookRows.length && state.facebookRows.every((row) => row.selected));
+    selectAll.indeterminate = state.facebookRows.some((row) => row.selected) && !selectAll.checked;
+    selectAll.disabled = state.isBusy;
+    updateFacebookCellSelectionDom();
+  }
+
+  function setFacebookTaskStatuses(
+    tasks: Array<{ postId: string; url: string }>,
+    status: string,
+    statusKind: FacebookInputRow["statusKind"],
+    shouldRender = true
+  ) {
+    const taskKeys = new Set(tasks.map((task) => `${stripSourceSuffix(task.postId)}\n${task.url}`));
+    const changedRows: FacebookInputRow[] = [];
+    state.facebookRows.forEach((row) => {
+      if (taskKeys.has(`${stripSourceSuffix(row.postId)}\n${row.url}`)) {
+        row.status = status;
+        row.statusKind = statusKind;
+        changedRows.push(row);
+      }
+    });
+    if (shouldRender) renderFacebookTable();
+    else changedRows.forEach(updateFacebookRowStatusDom);
+  }
+
+  function updateFacebookRowStatusDom(row: FacebookInputRow) {
+    const status = state.root?.querySelector<HTMLElement>(`.nlm-facebook-grid-row[data-row-key="${row.key}"] .nlm-facebook-row-status`);
+    if (!status) return;
+    status.className = `nlm-facebook-row-status is-${row.statusKind}`;
+    status.textContent = row.status;
+    status.title = row.status;
+  }
+
+  async function importFacebookMedia() {
+    const parsed = parseFacebookTableRows(state.facebookRows, FACEBOOK_MAX_TASKS);
+    renderFacebookTable();
+    if (!parsed.tasks.length) {
+      setStage(parsed.errors[0] || "请填写有效的 Facebook 公开视频任务");
+      return;
+    }
+    if (parsed.issues.length) {
+      setStage(`Facebook 表格有 ${parsed.issues.length} 行需要修正`);
+      parsed.errors.slice(0, 20).forEach((message) => addLog(message, "输入校验"));
+      return;
+    }
+
+    const databaseUrl = panelQuery<HTMLInputElement>("[data-role='database-url']").value.trim();
+    let sourceSummary;
+    try {
+      sourceSummary = await getNotebookSourceSummary();
+      if (state.autoRegisterImported && !(await validateAutomaticRegistration(databaseUrl))) return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStage("无法检查导入条件，请刷新 NotebookLM 后重试");
+      addLog(message, "预检查失败");
+      return;
+    }
+    const existingFingerprint = facebookJob ? facebookTaskFingerprint(facebookJob.tasks) : "";
+    const inputFingerprint = facebookTaskFingerprint(parsed.tasks);
+    const canResume = Boolean(facebookJob && facebookJob.status !== "completed" && existingFingerprint === inputFingerprint);
+    if (canResume && facebookJob!.activeSourceIds.length) {
+      const recovered = await recoverInterruptedFacebookBatch(facebookJob!, sourceSummary);
+      if (!recovered) return;
+      sourceSummary = recovered;
+    }
+
+    const currentCapacity = retainedSourceCapacity(sourceSummary.totalSources);
+    if (!state.autoDeleteImported) {
+      const required = canResume ? facebookJob!.tasks.length - facebookJob!.nextIndex : parsed.tasks.length;
+      if (required > currentCapacity) {
+        setStage(`自动移除已关闭：当前最多还能导入 ${currentCapacity} 个来源`);
+        addLog(`当前笔记本已有 ${sourceSummary.totalSources}/${NOTEBOOK_SOURCE_LIMIT} 个来源；待导入 ${required} 个，超出剩余名额 ${currentCapacity}。请减少输入或开启自动移除。`, "来源上限");
+        return;
+      }
+    }
+
+    if (!canResume) {
+      if (facebookJob && facebookJob.status !== "completed" && existingFingerprint !== inputFingerprint) {
+        const replace = window.confirm("当前笔记本还有未完成的 Facebook 队列。是否用新输入替换原队列？\n\n已完成并保存的转录记录会保留在结果中。");
+        if (!replace) return setStage("已保留原 Facebook 队列");
+      }
+      facebookJob = createFacebookJob(activeNotebookId, parsed.tasks, {
+        autoDelete: state.autoDeleteImported,
+        translate: state.translateEnabled,
+        autoRegister: state.autoRegisterImported
+      });
+      facebookJob.records = [];
+    } else {
+      facebookJob!.autoDelete = state.autoDeleteImported;
+      facebookJob!.translate = state.translateEnabled;
+      facebookJob!.autoRegister = state.autoRegisterImported;
+    }
+    const job = facebookJob;
+    if (!job) throw new Error("无法创建 Facebook 批量任务。");
+    linkFacebookRowsToJobTasks(job);
+
+    state.isBusy = true;
+    state.facebookActive = true;
+    facebookPauseRequested = false;
+    if (!canResume) state.logs = [];
+    state.bottomOpen = true;
+    state.bottomView = "logs";
+    parsed.errors.forEach((message) => addLog(message, "输入提示"));
+    addLog(`${canResume ? "继续" : "准备"}处理 ${job.tasks.length} 个 Facebook 公开视频；从第 ${job.nextIndex + 1} 条开始，每批最多 ${FACEBOOK_BATCH_SIZE} 条。`, "Facebook 队列");
+    job.status = "running";
+    job.lastError = undefined;
+    if (canResume) await saveFacebookCheckpoint();
+    else await extensionClient.saveFacebookJob(job);
+    render();
+
+    try {
+      let queueBatchSequence = 0;
+      while (job.nextIndex < job.tasks.length && !facebookPauseRequested) {
+        const summary = await getNotebookSourceSummary();
+        const batch = nextFacebookBatch(job, summary.totalSources);
+        if (!batch.length) {
+          throw new Error(`当前笔记本已有 ${summary.totalSources}/${NOTEBOOK_SOURCE_LIMIT} 个来源，没有可用来源名额。请清理来源后继续。`);
+        }
+        queueBatchSequence += 1;
+        const batchLabel = `${queueBatchSequence}（${job.nextIndex + 1}-${job.nextIndex + batch.length}/${job.tasks.length}）`;
+        setStage(`Facebook 批次 ${batchLabel}：处理 ${batch.length} 条…`);
+        addLog(`批次 ${batchLabel} 开始；当前来源 ${summary.totalSources}/${NOTEBOOK_SOURCE_LIMIT}。`, "Facebook 批次");
+        setFacebookTaskStatuses(batch, "处理中", "working");
+
+        job.activeBatchStart = job.nextIndex;
+        job.activeSourceIds = [];
+        await extensionClient.updateFacebookJobActiveSources(job.notebookId, job.activeBatchStart, []);
+        facebookCoordinator = new FacebookImportCoordinator({
+          onStage: setStage,
+          onLog: addLog,
+          onTaskStatus: (taskId, taskStatus, message) => {
+            const task = batch.find((item) => item.taskId === taskId);
+            if (!task) return;
+            const labels: Record<string, string> = {
+              downloaded: "下载完成",
+              uploading: "正在上传",
+              processing: "等待转录",
+              completed: "导入完成"
+            };
+            setFacebookTaskStatuses(
+              [task],
+              taskStatus === "failed" ? `失败：${message || "任务失败"}` : labels[taskStatus] || "处理中",
+              taskStatus === "failed" ? "error" : taskStatus === "completed" ? "success" : "working",
+              false
+            );
+          },
+          onSourcePrepared: async (sourceId) => {
+            if (!job.activeSourceIds.includes(sourceId)) job.activeSourceIds.push(sourceId);
+            await extensionClient.updateFacebookJobActiveSources(job.notebookId, job.activeBatchStart, job.activeSourceIds);
+          }
+        });
+        const records = await facebookCoordinator.start(batch, false);
+        facebookCoordinator = null;
+        const added = mergeRecords(records);
+        const batchRecords = resolveMergedRecords(records);
+        const failed = batchRecords.filter((record) => record.error || !record.transcript).length;
+        batch.forEach((task) => {
+          const record = batchRecords.find((item) => stripSourceSuffix(item.sourceName) === stripSourceSuffix(task.postId));
+          const failedTask = Boolean(record?.error || !record?.transcript);
+          setFacebookTaskStatuses(
+            [task],
+            failedTask ? `失败：${record?.error || "未返回转录"}` : "导入完成",
+            failedTask ? "error" : "success",
+            false
+          );
+        });
+        renderFacebookTable();
+
+        if (job.translate && added) {
+          await translateRecords({ sourceIds: batchRecords.map((record) => record.sourceId).filter(Boolean) });
+        }
+        if (job.autoRegister) {
+          await autoRegisterImportBatch(batchRecords, databaseUrl, `Facebook ${batchLabel}`);
+        }
+        if (job.autoDelete) {
+          const sourceIds = completedSourceIdsForCleanup(batchRecords, job.translate);
+          if (sourceIds.length) await deleteImportedBatch(sourceIds, batchLabel);
+          const retainedCompleted = batchRecords.filter((record) => record.sourceId && record.transcript && !record.error).length - sourceIds.length;
+          if (retainedCompleted > 0) {
+            addLog(`批次 ${batchLabel} 保留 ${retainedCompleted} 个未完成翻译的来源，便于稍后重试。`, "来源保留");
+          }
+        }
+
+        job.nextIndex += batch.length;
+        job.activeBatchStart = job.nextIndex;
+        job.activeSourceIds = [];
+        job.records = getFacebookJobRecords(job);
+        job.status = job.nextIndex >= job.tasks.length ? "completed" : "running";
+        job.lastError = undefined;
+        await saveFacebookCheckpoint(batchRecords);
+        addLog(`批次 ${batchLabel} 完成：转录成功 ${added}，失败 ${failed}；总进度 ${job.nextIndex}/${job.tasks.length}。`, failed ? "完成（有失败）" : "批次完成");
+        render();
+      }
+
+      if (facebookPauseRequested && job.nextIndex < job.tasks.length) {
+        job.status = "paused";
+        await saveFacebookCheckpoint();
+        setStage(`Facebook 队列已暂停：${job.nextIndex}/${job.tasks.length}`);
+      } else {
+        job.status = "completed";
+        await saveFacebookCheckpoint();
+        const failures = job.records.filter((record) => record.error || !record.transcript).length;
+        setStage(`Facebook 队列完成：${job.nextIndex}/${job.tasks.length}，失败 ${failures}`);
+        addLog(`Facebook 队列全部完成：共 ${job.tasks.length} 条。`, failures ? "完成（有失败）" : "完成");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await facebookCoordinator?.cancel();
+      if (facebookJob) {
+        if (facebookJob.autoDelete && facebookJob.activeSourceIds.length) {
+          await cleanupInterruptedFacebookSources(facebookJob);
+        }
+        facebookJob.status = "paused";
+        facebookJob.lastError = message;
+        facebookJob.records = getFacebookJobRecords(facebookJob);
+        await saveFacebookCheckpoint();
+      }
+      setStage(`${message} 已保存进度，可处理问题后继续。`);
+      addLog(`${message}；检查点停在 ${facebookJob?.nextIndex || 0}/${facebookJob?.tasks.length || 0}。`, "队列暂停");
+    } finally {
+      facebookCoordinator = null;
+      state.facebookActive = false;
+      state.isBusy = false;
+      facebookPauseRequested = false;
+      render();
+    }
+  }
+
+  async function restoreFacebookJob() {
+    const notebookId = activeNotebookId;
+    if (!notebookId) return;
+    try {
+      const saved = await extensionClient.loadFacebookJob(notebookId);
+      if (activeNotebookId !== notebookId) return;
+      if (!saved) {
+        facebookJob = null;
+        return;
+      }
+      facebookJob = saved;
+      if (facebookJob.status === "running") {
+        facebookJob.status = "paused";
+        facebookJob.lastError = "页面或浏览器在批次运行期间中断。";
+        await saveFacebookCheckpoint();
+      }
+      state.records = Array.isArray(facebookJob.records) ? facebookJob.records.slice() : [];
+      if (state.root) {
+        state.facebookRows = facebookJob.tasks.map((task, index) => {
+          const record = facebookJob!.records.find((item) => stripSourceSuffix(item.sourceName) === stripSourceSuffix(task.postId));
+          const completed = index < facebookJob!.nextIndex;
+          const row = createFacebookInputRow(
+            task.postId,
+            task.url,
+            record?.error ? `失败：${record.error}` : completed ? "已处理" : "待处理"
+          );
+          row.statusKind = record?.error ? "error" : completed ? "success" : "idle";
+          row.persistedTaskId = task.taskId;
+          return row;
+        });
+        renderFacebookTable();
+      }
+      state.stage = facebookJob.status === "completed"
+        ? `已恢复已完成队列：${facebookJob.nextIndex}/${facebookJob.tasks.length}`
+        : `发现未完成队列：${facebookJob.nextIndex}/${facebookJob.tasks.length}，可继续`;
+      render();
+    } catch (error) {
+      addLog(`恢复 Facebook 队列失败：${error instanceof Error ? error.message : String(error)}`, "检查点");
+    }
+  }
+
+  async function saveFacebookCheckpoint(records: TranscriptRecord[] = []) {
+    if (!facebookJob) return;
+    facebookJob.updatedAt = Date.now();
+    await extensionClient.updateFacebookJobProgress({
+      notebookId: facebookJob.notebookId,
+      status: facebookJob.status,
+      nextIndex: facebookJob.nextIndex,
+      activeBatchStart: facebookJob.activeBatchStart,
+      activeSourceIds: facebookJob.activeSourceIds.slice(),
+      autoDelete: facebookJob.autoDelete,
+      translate: facebookJob.translate,
+      autoRegister: facebookJob.autoRegister,
+      lastError: facebookJob.lastError,
+      records: records.map((record) => ({ ...record }))
+    });
+  }
+
+  function linkFacebookRowsToJobTasks(job: FacebookBulkJob) {
+    const tasksByKey = new Map(job.tasks.map((task) => [
+      `${stripSourceSuffix(task.postId)}\n${task.url.trim()}`,
+      task.taskId
+    ]));
+    state.facebookRows.forEach((row) => {
+      row.persistedTaskId = tasksByKey.get(`${stripSourceSuffix(row.postId)}\n${row.url.trim()}`);
+    });
+  }
+
+  async function recoverInterruptedFacebookBatch(
+    job: FacebookBulkJob,
+    sourceSummary: { totalSources: number; sourceIds: string[] }
+  ): Promise<{ totalSources: number; sourceIds: string[] } | null> {
+    const existingIds = new Set(sourceSummary.sourceIds);
+    job.activeSourceIds = job.activeSourceIds.filter((sourceId) => existingIds.has(sourceId));
+    if (!job.activeSourceIds.length) {
+      job.activeBatchStart = job.nextIndex;
+      await saveFacebookCheckpoint();
+      return sourceSummary;
+    }
+    if (!state.autoDeleteImported) {
+      setStage(`发现上次中断批次遗留 ${job.activeSourceIds.length} 个来源`);
+      addLog("自动移除已关闭，无法安全判断遗留来源是否完成。请开启自动移除后继续，或手动清理这些来源并刷新页面。", "断点恢复");
+      return null;
+    }
+
+    setStage(`正在清理上次中断批次的 ${job.activeSourceIds.length} 个来源…`);
+    addLog(`检查点位于第 ${job.activeBatchStart + 1} 条；正在精确清理未提交批次后重试。`, "断点恢复");
+    await cleanupInterruptedFacebookSources(job);
+    if (job.activeSourceIds.length) {
+      setStage(`中断批次仍有 ${job.activeSourceIds.length} 个来源无法移除`);
+      addLog("请手动清理失败来源后刷新页面再继续，避免产生重复来源。", "断点恢复失败");
+      return null;
+    }
+    await saveFacebookCheckpoint();
+    addLog("上次中断批次已清理，将从该批次起点重新执行。", "断点恢复");
+    return getNotebookSourceSummary();
+  }
+
+  async function cleanupInterruptedFacebookSources(job: FacebookBulkJob): Promise<void> {
+    const candidateIds = Array.from(new Set(job.activeSourceIds.filter(Boolean)));
+    if (!candidateIds.length) return;
+    try {
+      const result = await deleteNotebookSources(candidateIds);
+      markSourcesDeleted(result.deleted);
+      const refreshed = await getNotebookSourceSummary();
+      const stillExisting = new Set(refreshed.sourceIds);
+      job.activeSourceIds = candidateIds.filter((sourceId) => stillExisting.has(sourceId));
+    } catch (cleanupError) {
+      addLog(`中断批次清理失败：${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`, "断点恢复失败");
+    }
+    await extensionClient.updateFacebookJobActiveSources(job.notebookId, job.activeBatchStart, job.activeSourceIds);
+  }
+
+  async function getNotebookSourceSummary(): Promise<{ totalSources: number; sourceIds: string[] }> {
+    const summary = await callPageApi("get-source-summary", {}, API_TIMEOUT_MS);
+    return {
+      totalSources: Math.max(0, Number(summary?.totalSources) || 0),
+      sourceIds: Array.isArray(summary?.sourceIds) ? summary.sourceIds.filter(Boolean) : []
+    };
+  }
+
+  function resolveMergedRecords(records: TranscriptRecord[]): TranscriptRecord[] {
+    return records.map((record) => {
+      if (record.sourceId) {
+        const matched = state.records.find((item) => item.sourceId === record.sourceId);
+        if (matched) return matched;
+      }
+      const normalizedName = stripSourceSuffix(record.sourceName);
+      return state.records.find((item) => item.sourceName === normalizedName && item.error === record.error) || record;
+    });
+  }
+
+  function getFacebookJobRecords(job: FacebookBulkJob): TranscriptRecord[] {
+    const sourceNames = new Set(job.tasks.map((task) => stripSourceSuffix(task.postId)));
+    return state.records.filter((record) => sourceNames.has(record.sourceName)).map((record) => ({ ...record }));
+  }
+
+  async function autoRegisterImportBatch(records: TranscriptRecord[], databaseUrl: string, batchLabel: string) {
+    const available = records.filter((record) => record.transcript && !record.error);
+    if (!available.length) {
+      addLog(`${batchLabel} 没有成功转录，已跳过自动登记。`, "自动登记");
+      return;
+    }
+    const sheetRecords = toSheetRecords(available, sourceNameToPostId);
+    try {
+      const result = await callSheetUpsert(databaseUrl, sheetRecords);
+      const analysis = analyzeBatchResponse(result as any, sheetRecords, { batchStart: 0, batchLabel });
+      addLog(formatStatusCounts(analysis.statusCounts), "自动登记 status_counts");
+      analysis.failureLogs.forEach((entry) => addLog(entry.message, entry.title));
+      if (!analysis.failed) {
+        available.forEach((record) => {
+          record.registered = true;
+          record.registrationError = undefined;
+        });
+      } else {
+        available.forEach((record) => { record.registrationError = `批次自动登记存在 ${analysis.failed} 条失败，可稍后手动登记。`; });
+      }
+      addLog(`${batchLabel} 自动登记：成功 ${analysis.success}，失败 ${analysis.failed}。`, analysis.failed ? "自动登记失败" : "自动登记");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      available.forEach((record) => { record.registrationError = message; });
+      addLog(`${batchLabel} 自动登记请求失败：${message}。队列将继续，稍后可手动登记。`, "自动登记失败");
+    }
+  }
+
+  function handleDriveLoaderMessage(event) {
+    if (!driveLoaderFrame || event.source !== driveLoaderFrame.contentWindow ||
+      event.origin !== extensionResources.extensionOrigin) return;
+    const { source, target, type, token, requestId, payload } = event.data || {};
+    if (source !== APP_ID || target !== "content" || token !== DRIVE_BRIDGE_TOKEN) return;
+    const pending = pendingDriveDownloads.get(requestId);
+    if (!pending) return;
+
+    if (type === "drive-download-progress") {
+      const received = Number(payload && payload.receivedBytes) || 0;
+      const total = Number(payload && payload.totalBytes) || 0;
+      pending.receivedBytes = received;
+      pending.totalBytes = total;
+      refreshDriveActivity();
+      return;
+    }
+    if (type !== "drive-download-response") return;
+
+    pendingDriveDownloads.delete(requestId);
+    clearTimeout(pending.timeoutId);
+    refreshDriveActivity();
+    if (payload && payload.ok && payload.file instanceof File) {
+      pending.resolve(payload.file);
+    } else {
+      pending.reject(new Error((payload && payload.error) || "Drive 文件下载失败。"));
+    }
+  }
+
+  async function importDriveMedia() {
+    const input = panelQuery<HTMLTextAreaElement>("[data-role='drive-urls']");
+    const urls = parseDriveUrls(input.value);
+    if (!urls.length) {
+      setStage("请粘贴有效的 Drive 文件链接");
+      return;
+    }
+
+    const databaseUrl = panelQuery<HTMLInputElement>("[data-role='database-url']").value.trim();
+    let sourceSummary;
+    try {
+      sourceSummary = await getNotebookSourceSummary();
+      if (state.autoRegisterImported && !(await validateAutomaticRegistration(databaseUrl))) return;
+    } catch (error) {
+      setStage("无法检查 Drive 导入条件");
+      addLog(error instanceof Error ? error.message : String(error), "预检查失败");
+      return;
+    }
+    if (!state.autoDeleteImported) {
+      const capacity = retainedSourceCapacity(sourceSummary.totalSources);
+      if (urls.length > capacity) {
+        setStage(`自动移除已关闭：当前最多还能导入 ${capacity} 个来源`);
+        addLog(`当前笔记本已有 ${sourceSummary.totalSources}/${NOTEBOOK_SOURCE_LIMIT} 个来源；待导入 ${urls.length} 个，超过剩余名额 ${capacity}。`, "来源上限");
+        return;
+      }
+    }
+
+    const batchInput = panelQuery<HTMLInputElement>("[data-role='drive-batch-size']");
+    state.driveBatchSize = normalizeDriveBatchSize(batchInput.value);
+    batchInput.value = String(state.driveBatchSize);
+    await savePanelSettings();
+
+    state.isBusy = true;
+    state.logs = [];
+    state.bottomOpen = true;
+    state.bottomView = "logs";
+    const totalBatches = Math.ceil(urls.length / state.driveBatchSize);
+    addLog(`准备导入 ${urls.length} 个公开 Drive 文件：共 ${totalBatches} 批，每批最多 ${state.driveBatchSize} 个。`, "导入");
+    if (!state.autoDeleteImported && totalBatches > 1) {
+      addLog("自动移除已关闭；多批次来源会持续占用当前笔记本名额，达到上限后后续上传可能失败。", "提醒");
+    }
+    render();
+
+    let succeeded = 0;
+    let failed = 0;
+    let processingFailed = 0;
+    let transcriptsAdded = 0;
+    let autoDeleted = 0;
+
+    try {
+      await ensureDriveLoader();
+      for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
+        const batchStart = batchIndex * state.driveBatchSize;
+        const batchUrls = urls.slice(batchStart, batchStart + state.driveBatchSize);
+        const batchLabel = `${batchIndex + 1}/${totalBatches}`;
+        setStage(`正在处理批次 ${batchLabel}（${batchUrls.length} 个文件）…`);
+        addLog(`批次 ${batchLabel} 开始：${batchUrls.length} 个文件。`, "批次");
+
+        const uploadSummary = await uploadDriveBatch(batchUrls, batchStart, urls.length);
+        succeeded += uploadSummary.succeeded;
+        failed += uploadSummary.failed;
+
+        const extractionSummary = await extractDriveBatch(uploadSummary.uploadedSources, batchLabel);
+        transcriptsAdded += extractionSummary.transcriptsAdded;
+        processingFailed += extractionSummary.processingFailed;
+
+        let translationSummary = emptyTranslationSummary();
+        if (state.translateEnabled && extractionSummary.extractedSourceIds.length) {
+          setStage(`批次 ${batchLabel}：正在进行 AI 翻译…`);
+          translationSummary = await translateRecords({ sourceIds: extractionSummary.extractedSourceIds });
+        }
+
+        const extractedIds = new Set<string>(extractionSummary.extractedSourceIds as string[]);
+        const batchRecords = state.records.filter((record) => extractedIds.has(record.sourceId));
+        if (state.autoRegisterImported) {
+          await autoRegisterImportBatch(batchRecords, databaseUrl, `Drive ${batchLabel}`);
+        }
+
+        const deletionCandidates = completedSourceIdsForCleanup(batchRecords, state.translateEnabled);
+        let batchDeleted = 0;
+        if (state.autoDeleteImported && deletionCandidates.length) {
+          batchDeleted = await deleteImportedBatch(deletionCandidates, batchLabel);
+          autoDeleted += batchDeleted;
+        }
+
+        const retainedSources = Math.max(0, uploadSummary.uploadedSources.length - batchDeleted);
+        if (state.autoDeleteImported && retainedSources) {
+          addLog(
+            `批次 ${batchLabel} 仍保留 ${retainedSources} 个来源（转录或自动移除未成功），会继续占用 NotebookLM 来源名额。`,
+            "提醒"
+          );
+        }
+
+        addLog(
+          `批次 ${batchLabel} 完成：上传成功 ${uploadSummary.succeeded}，上传失败 ${uploadSummary.failed}，` +
+          `转录成功 ${extractionSummary.transcriptsAdded}，转录失败 ${extractionSummary.processingFailed}，` +
+          `AI 翻译成功 ${translationSummary.translated}，失败 ${translationSummary.failed}，自动移除 ${batchDeleted}。`,
+          "批次汇总"
+        );
+        render();
+      }
+
+      const totalFailed = failed + processingFailed;
+      setStage(totalFailed
+        ? `导入结束：转录成功 ${transcriptsAdded}，失败 ${totalFailed}`
+        : `导入完成：成功 ${transcriptsAdded}`);
+      addLog(`总计 ${urls.length}；上传成功 ${succeeded}；上传失败 ${failed}；转录成功 ${transcriptsAdded}；转录失败 ${processingFailed}；自动移除 ${autoDeleted}。`, "汇总");
+    } catch (error) {
+      setStage("Drive 导入初始化失败");
+      addLog(error.message || String(error), "失败");
+    } finally {
+      state.driveActivity.download = "";
+      state.driveActivity.upload = "";
+      activeDriveUploads.clear();
+      state.isBusy = false;
+      render();
+    }
+  }
+
+  async function validateAutomaticRegistration(databaseUrl: string): Promise<boolean> {
+    const settings = await extensionClient.getSettings();
+    if (!validDeploymentUrl(settings.deploymentUrl)) {
+      setStage("自动登记未启动：请先在插件图标中填写完整部署脚本链接");
+      addLog("Apps Script 部署链接必须是 https://script.google.com/macros/s/.../exec。", "配置不完整");
+      return false;
+    }
+    if (!validDatabaseUrl(databaseUrl)) {
+      setStage("自动登记未启动：请填写含 gid 的 Google 表格编辑链接");
+      addLog("表格链接必须是 Google Sheets 编辑链接，并包含目标工作表 gid。", "配置不完整");
+      return false;
+    }
+    if (databaseUrl !== settings.databaseUrl) await extensionClient.saveDatabaseUrl(databaseUrl);
+    return true;
+  }
+
+  async function uploadDriveBatch(batchUrls, batchStart, totalUrls) {
+    const startedAt = Date.now();
+    const workerCount = Math.min(DRIVE_PIPELINE_CONCURRENCY, batchUrls.length);
+    const results = await mapConcurrent(batchUrls, workerCount, async (url, localIndex) => {
+      try {
+        return await importOneDriveFile(url, batchStart + localIndex, totalUrls);
+      } catch (error) {
+        const position = `${batchStart + localIndex + 1}/${totalUrls}`;
+        addLog(`${position} 未预期错误：${error.message || String(error)}`, "导入失败");
+        return { ok: false };
+      }
+    });
+    const uploadedSources = results
+      .filter((result) => result && result.ok && result.sourceId)
+      .map((result) => ({ sourceId: result.sourceId, fileName: result.fileName }));
+    const succeeded = uploadedSources.length;
+    const failed = results.length - succeeded;
+    addLog(
+      `本批下载与上传完成：${workerCount} 路受控并发，成功 ${succeeded}，失败 ${failed}，耗时 ${formatDuration(Date.now() - startedAt)}。`,
+      "上传汇总"
+    );
+    return { uploadedSources, succeeded, failed };
+  }
+
+  async function importOneDriveFile(url, globalIndex, totalUrls) {
+    const position = `${globalIndex + 1}/${totalUrls}`;
+    let file;
+    try {
+      file = await downloadDriveMediaWithRetry(url, position);
+      const mediaKind = file.type.startsWith("video/") ? "视频" : "音频";
+      addLog(`${position} 已识别${mediaKind}：${file.name}（${file.type}，${formatBytes(file.size)}）`, "下载");
+    } catch (error) {
+      addLog(`${position} ${error.message || String(error)}`, "下载失败");
+      return { ok: false };
+    }
+
+    const activityId = `${globalIndex}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    activeDriveUploads.set(activityId, { position, fileName: file.name });
+    refreshDriveActivity();
+    try {
+      const result = await callPageApi("upload-media-source", {
+        file,
+        options: { timeoutMs: MEDIA_UPLOAD_TIMEOUT_MS, pollIntervalMs: 3000 }
+      }, MEDIA_UPLOAD_TIMEOUT_MS);
+      if (!result || !result.sourceId) {
+        throw new Error("NotebookLM 已接收文件，但未返回可用于提取的来源标识。");
+      }
+      addLog(`${position} 已加入 NotebookLM：${file.name}`, "成功");
+      return { ok: true, sourceId: result.sourceId, fileName: result.fileName || file.name };
+    } catch (error) {
+      addLog(`${position} ${error.message || String(error)}`, "上传失败");
+      return { ok: false };
+    } finally {
+      activeDriveUploads.delete(activityId);
+      refreshDriveActivity();
+      render();
+    }
+  }
+
+  async function extractDriveBatch(uploadedSources, batchLabel) {
+    if (!uploadedSources.length) {
+      return { transcriptsAdded: 0, processingFailed: 0, extractedSourceIds: [] };
+    }
+
+    setStage(`批次 ${batchLabel}：等待 ${uploadedSources.length} 个来源生成转录…`);
+    addLog(`批次 ${batchLabel} 上传结束，开始等待并提取 ${uploadedSources.length} 个新增来源。`, "提取");
+    try {
+      const sourceNames = Object.fromEntries(uploadedSources.map((item) => [item.sourceId, item.fileName]));
+      const result = await callPageApi("extract-existing-sources", {
+        sourceIds: uploadedSources.map((item) => item.sourceId),
+        sourceNames,
+        waitForReady: true,
+        timeoutMs: BATCH_EXTRACTION_TIMEOUT_MS - PAGE_RESPONSE_GRACE_MS,
+        overallTimeoutMs: BATCH_EXTRACTION_TIMEOUT_MS - PAGE_RESPONSE_GRACE_MS,
+        pollIntervalMs: 3000
+      }, BATCH_EXTRACTION_TIMEOUT_MS);
+      const returnedRecords = Array.isArray(result.records) ? result.records : [];
+      const returnedIds = new Set(returnedRecords.map((record) => record.sourceId).filter(Boolean));
+      const missingRecords = uploadedSources
+        .filter((item) => item.sourceId && !returnedIds.has(item.sourceId))
+        .map((item) => ({
+          sourceId: item.sourceId,
+          sourceName: item.fileName,
+          transcript: "",
+          error: "NotebookLM 未返回该来源的处理结果。"
+        }));
+      const importedRecords = [...returnedRecords, ...missingRecords];
+      const transcriptsAdded = mergeRecords(importedRecords);
+      const processingFailed = importedRecords.filter((record) => record.error || !record.transcript).length;
+      const extractedSourceIds = importedRecords
+        .filter((record) => record.sourceId && record.transcript && !record.error)
+        .map((record) => record.sourceId);
+      importedRecords.filter((record) => record.error).forEach((record) => {
+        addLog(`${record.sourceName || record.sourceId}：${record.error}`, "转录失败");
+      });
+      return { transcriptsAdded, processingFailed, extractedSourceIds };
+    } catch (error) {
+      const message = error.message || String(error);
+      const failedRecords = uploadedSources.map((item) => ({
+        sourceId: item.sourceId,
+        sourceName: item.fileName,
+        transcript: "",
+        error: message
+      }));
+      mergeRecords(failedRecords);
+      addLog(`批次 ${batchLabel} 文件已上传，但提取转录失败：${message}`, "转录失败");
+      return { transcriptsAdded: 0, processingFailed: failedRecords.length, extractedSourceIds: [] };
+    }
+  }
+
+  async function deleteImportedBatch(sourceIds, batchLabel) {
+    if (!Array.isArray(sourceIds) || !sourceIds.length) return 0;
+    setStage(`批次 ${batchLabel}：正在移除 ${sourceIds.length} 个已完成来源…`);
+    try {
+      const deletion = await deleteNotebookSources(sourceIds);
+      markSourcesDeleted(deletion.deleted);
+      addLog(`批次 ${batchLabel} 自动移除成功 ${deletion.deleted.length} 个；失败 ${deletion.failed.length} 个。`, "来源清理");
+      deletion.failed.forEach((item) => addLog(`${item.sourceName || item.sourceId}：${item.error}`, "移除失败"));
+      return deletion.deleted.length;
+    } catch (error) {
+      addLog(`批次 ${batchLabel} 转录已保留，但自动移除失败：${error.message || String(error)}`, "移除失败");
+      return 0;
+    }
+  }
+
+  async function deleteAllSources() {
+    const confirmed = window.confirm("确定要永久移除当前笔记本中的全部来源吗？\n\n已提取到插件面板中的文字会保留，但 NotebookLM 来源无法恢复。");
+    if (!confirmed) {
+      setStage("已取消清空来源");
+      return;
+    }
+
+    state.isBusy = true;
+    state.bottomOpen = true;
+    state.bottomView = "logs";
+    setStage("正在读取并移除全部来源…");
+    addLog("用户已确认清空当前笔记本来源。", "来源清理");
+    render();
+    try {
+      const result = await deleteNotebookSources();
+      markSourcesDeleted(result.deleted);
+      addLog(`批量移除完成：成功 ${result.deleted.length} 个，失败 ${result.failed.length} 个。`, "来源清理");
+      result.failed.forEach((item) => addLog(`${item.sourceName || item.sourceId}：${item.error}`, "移除失败"));
+      setStage(result.failed.length
+        ? `来源清理完成：成功 ${result.deleted.length}，失败 ${result.failed.length}`
+        : `已移除 ${result.deleted.length} 个来源`);
+    } catch (error) {
+      setStage("批量移除来源失败");
+      addLog(error.message || String(error), "移除失败");
+    } finally {
+      state.isBusy = false;
+      render();
+    }
+  }
+
+  function deleteNotebookSources(sourceIds: string[] = []) {
+    const normalizedIds = Array.isArray(sourceIds) ? Array.from(new Set(sourceIds.filter(Boolean))) : [];
+    return callPageApi("delete-sources", {
+      sourceIds: normalizedIds,
+      deleteAll: normalizedIds.length === 0
+    }, API_TIMEOUT_MS);
+  }
+
+  function markSourcesDeleted(sourceIds) {
+    const deletedIds = new Set(Array.isArray(sourceIds) ? sourceIds : []);
+    state.records.forEach((record) => {
+      if (deletedIds.has(record.sourceId)) record.sourceDeleted = true;
+    });
+  }
+
+  async function downloadDriveMediaWithRetry(url, position) {
+    let lastError;
+    for (let attempt = 1; attempt <= DRIVE_DOWNLOAD_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        return await downloadDriveMedia(url, position);
+      } catch (error) {
+        lastError = error;
+        if (attempt >= DRIVE_DOWNLOAD_MAX_ATTEMPTS || !isRetryableDriveError(error)) break;
+        const delayMs = DRIVE_RETRY_BASE_DELAY_MS * attempt;
+        addLog(`${position} 下载临时失败，${Math.ceil(delayMs / 1000)} 秒后重试（${attempt + 1}/${DRIVE_DOWNLOAD_MAX_ATTEMPTS}）。`, "自动重试");
+        await wait(delayMs);
+      }
+    }
+    throw lastError || new Error("Drive 文件下载失败。");
+  }
+
+  function ensureDriveLoader() {
+    if (driveLoaderReady) return driveLoaderReady;
+    driveLoaderFrame = document.createElement("iframe");
+    driveLoaderFrame.className = "nlm-drive-loader-frame";
+    driveLoaderFrame.setAttribute("aria-hidden", "true");
+    driveLoaderFrame.src = `${extensionResources.driveLoaderUrl}#token=${encodeURIComponent(DRIVE_BRIDGE_TOKEN)}`;
+    driveLoaderReady = new Promise((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => reject(new Error("Drive 下载组件加载超时。")), 15000);
+      driveLoaderFrame.addEventListener("load", () => {
+        clearTimeout(timeoutId);
+        resolve();
+      }, { once: true });
+      driveLoaderFrame.addEventListener("error", () => {
+        clearTimeout(timeoutId);
+        reject(new Error("Drive 下载组件加载失败。"));
+      }, { once: true });
+    });
+    document.documentElement.appendChild(driveLoaderFrame);
+    return driveLoaderReady;
+  }
+
+  async function downloadDriveMedia(url, position) {
+    await ensureDriveLoader();
+    const requestId = `drive-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return new Promise((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        pendingDriveDownloads.delete(requestId);
+        refreshDriveActivity();
+        reject(new Error("Drive 文件下载超时。"));
+      }, DRIVE_DOWNLOAD_TIMEOUT_MS);
+      pendingDriveDownloads.set(requestId, { resolve, reject, timeoutId, position, receivedBytes: 0, totalBytes: 0 });
+      refreshDriveActivity();
+      driveLoaderFrame.contentWindow!.postMessage({
+        source: APP_ID,
+        target: "drive-loader",
+        type: "drive-download-request",
+        token: DRIVE_BRIDGE_TOKEN,
+        requestId,
+        url
+      }, extensionResources.extensionOrigin);
+    });
+  }
+
+  function normalizeDriveBatchSize(value) {
+    return normalizeBatchSize(value, {
+      defaultValue: DEFAULT_DRIVE_BATCH_SIZE,
+      min: MIN_DRIVE_BATCH_SIZE,
+      max: MAX_DRIVE_BATCH_SIZE
+    });
+  }
+
+  function refreshDriveActivity() {
+    const downloads = Array.from(pendingDriveDownloads.values());
+    const receivedBytes = downloads.reduce((sum, item) => sum + (Number(item.receivedBytes) || 0), 0);
+    const totalBytes = downloads.reduce((sum, item) => sum + (Number(item.totalBytes) || 0), 0);
+    state.driveActivity.download = downloads.length
+      ? `下载中 ${downloads.length} 个 · ${formatBytes(receivedBytes)}${totalBytes ? `/${formatBytes(totalBytes)}` : ""}`
+      : "";
+    state.driveActivity.upload = activeDriveUploads.size ? `上传中 ${activeDriveUploads.size} 个` : "";
+    const stages = [state.driveActivity.upload, state.driveActivity.download].filter(Boolean);
+    if (stages.length) setStage(stages.join(" · "));
+  }
+
+  function wait(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
+  async function extractAllSources() {
+    state.isBusy = true;
+    state.bottomOpen = true;
+    state.bottomView = "results";
+    setStage("正在检查新来源…");
+    render();
+    try {
+      const cachedSourceIds = state.records
+        .filter((record) => record.sourceId && record.transcript && !record.error)
+        .map((record) => record.sourceId);
+      const result = await callPageApi("extract-existing-sources", {
+        skipSourceIds: cachedSourceIds
+      }, API_TIMEOUT_MS);
+      const received = Array.isArray(result.records) ? result.records : [];
+      const extracted = mergeRecords(received);
+      const failed = received.filter((record) => record.error || !record.transcript).length;
+      const skipped = Number(result.skipped) || 0;
+      addLog(`提取成功 ${extracted} 个；失败 ${failed} 个；跳过会话内已有记录 ${skipped} 个。`, failed ? "提取完成（有失败）" : "提取");
+      if (state.translateEnabled && extracted) await translateRecords();
+      setStage(failed
+        ? `提取结束：成功 ${extracted}，失败 ${failed}`
+        : extracted
+        ? (state.translateEnabled ? "新来源提取与翻译完成" : "新来源提取完成")
+        : `没有新来源，已跳过 ${skipped} 个`);
+    } catch (error) {
+      setStage("提取失败");
+      addLog(error.message || String(error), "失败");
+    } finally {
+      state.isBusy = false;
+      render();
+    }
+  }
+
+  function mergeRecords(records) {
+    let transcriptCount = 0;
+    records.forEach((incoming) => {
+      const record = {
+        ...incoming,
+        sourceOriginalName: String(incoming.sourceName || "").trim(),
+        sourceName: stripSourceSuffix(incoming.sourceName)
+      };
+      const existingIndex = record.sourceId
+        ? state.records.findIndex((item) => item.sourceId === record.sourceId)
+        : -1;
+      if (existingIndex >= 0) {
+        state.records[existingIndex] = {
+          ...state.records[existingIndex],
+          ...record,
+          sourceOriginalName: record.sourceOriginalName || state.records[existingIndex].sourceOriginalName || state.records[existingIndex].sourceName
+        };
+      }
+      else state.records.push(record);
+      if (record.transcript && !record.error) transcriptCount += 1;
+    });
+    return transcriptCount;
+  }
+
+  async function translateExistingRecords() {
+    state.isBusy = true;
+    state.bottomOpen = true;
+    state.bottomView = "results";
+    render();
+    try {
+      const summary = await translateRecords();
+      setStage(summary.failed
+        ? `AI 翻译完成：成功 ${summary.translated}，失败 ${summary.failed}`
+        : summary.translated
+        ? `AI 翻译完成：成功 ${summary.translated}`
+        : "没有可进行 AI 翻译的来源");
+    } finally {
+      state.isBusy = false;
+      render();
+    }
+  }
+
+  async function translateRecords(options: { sourceIds?: string[] } = {}) {
+    const requestedSourceIds = new Set(Array.isArray(options.sourceIds) ? options.sourceIds.filter(Boolean) : []);
+    const records = state.records.filter((record) => {
+      if (!record.transcript || record.error || record.translation) return false;
+      return !requestedSourceIds.size || requestedSourceIds.has(record.sourceId);
+    });
+    const summary = emptyTranslationSummary();
+    if (!records.length) return summary;
+
+    const originalSelection = captureSourceSelection(document);
+    try {
+      for (let offset = 0; offset < records.length; offset += AI_TRANSLATION_BATCH_SIZE) {
+        const batch = records.slice(offset, offset + AI_TRANSLATION_BATCH_SIZE);
+        const batchLabel = `${Math.floor(offset / AI_TRANSLATION_BATCH_SIZE) + 1}/${Math.ceil(records.length / AI_TRANSLATION_BATCH_SIZE)}`;
+        setStage(`AI 翻译批次 ${batchLabel}（${batch.length} 个来源）…`);
+        addLog(`AI 翻译批次 ${batchLabel}：准备 ${batch.length} 个已有转录来源。`, "AI 翻译");
+        const batchSummary = await translateAiBatchWithRecovery(batch, batchLabel);
+        summary.translated += batchSummary.translated;
+        summary.failed += batchSummary.failed;
+        summary.translatedSourceIds.push(...batchSummary.translatedSourceIds);
+        render();
+      }
+    } finally {
+      restoreSourceSelection(originalSelection, document);
+    }
+    return summary;
+  }
+
+  function emptyTranslationSummary() {
+    return { translated: 0, failed: 0, translatedSourceIds: [] as string[] };
+  }
+
+  async function translateAiBatchWithRecovery(records, batchLabel, allowSplit = true) {
+    const summary = emptyTranslationSummary();
+    let pending = records.slice();
+    let lastError = "";
+
+    for (let attempt = 0; pending.length && attempt <= AI_TRANSLATION_RETRY_LIMIT; attempt += 1) {
+      try {
+        const sourceControls = await selectSourcesForRecordsWhenReady(
+          pending,
+          sourceNamesMatch,
+          document,
+          { attempts: 8, delayMs: 750 }
+        );
+        if (sourceControls.missing.length) {
+          sourceControls.missing.forEach((record) => {
+            record.translationError = "来源已取得转录，但左侧来源列表在等待同步后仍未显示；本次暂不翻译和移除。";
+            addLog(`${record.sourceName || "未命名来源"}：${record.translationError}`, "AI 翻译跳过");
+          });
+          summary.failed += sourceControls.missing.length;
+          pending = sourceControls.selected;
+        }
+        if (!pending.length) break;
+
+        await wait(220);
+        if (!sourcesAreSelected(pending, document)) {
+          throw new Error("NotebookLM 未能切换到当前翻译来源，请重试。");
+        }
+        const payload = await submitNotebookAiTranslationPrompt();
+        const result = mergeTranslationPayload(payload, pending);
+        summary.translated += result.translated.length;
+        summary.translatedSourceIds.push(...result.translated.map((record) => record.sourceId).filter(Boolean));
+        pending = result.missing;
+        if (result.unknown.length) {
+          addLog(`批次 ${batchLabel} 返回 ${result.unknown.length} 条无法匹配的来源，已忽略。`, "AI 翻译校验");
+        }
+        if (pending.length) {
+          addLog(`批次 ${batchLabel} 仍缺少 ${pending.length} 条翻译，将仅重试缺少来源。`, "AI 翻译重试");
+        }
+      } catch (error) {
+        lastError = error && error.message ? error.message : String(error);
+        addLog(`批次 ${batchLabel} 第 ${attempt + 1} 次请求失败：${lastError}`, "AI 翻译失败");
+      }
+    }
+
+    if (pending.length && allowSplit && pending.length > AI_TRANSLATION_SPLIT_SIZE) {
+      addLog(`批次 ${batchLabel} 未完成 ${pending.length} 条，拆分为最多 ${AI_TRANSLATION_SPLIT_SIZE} 条后重试。`, "AI 翻译恢复");
+      for (let index = 0; index < pending.length; index += AI_TRANSLATION_SPLIT_SIZE) {
+        const child = await translateAiBatchWithRecovery(
+          pending.slice(index, index + AI_TRANSLATION_SPLIT_SIZE),
+          `${batchLabel}.${Math.floor(index / AI_TRANSLATION_SPLIT_SIZE) + 1}`,
+          false
+        );
+        summary.translated += child.translated;
+        summary.failed += child.failed;
+        summary.translatedSourceIds.push(...child.translatedSourceIds);
+      }
+      return summary;
+    }
+
+    pending.forEach((record) => {
+      record.translationError = lastError || "NotebookLM 未返回该来源的完整中文翻译。";
+      addLog(`${record.sourceName || "未命名来源"}：${record.translationError}`, "AI 翻译失败");
+    });
+    summary.failed += pending.length;
+    return summary;
+  }
+
+  async function submitNotebookAiTranslationPrompt() {
+    const input = findChatInput(document, state.root);
+    const chatPanel = findChatPanel(input, document);
+    if (!input) throw new Error("未找到 NotebookLM 对话输入框，请确认笔记本页面已加载完成后重试。");
+    const knownPayloads = new Set<string>(getAiResponseTexts(chatPanel || document)
+      .flatMap((text) => extractJsonArrayCandidates(text).map((item) => item.raw)));
+    const prompt = buildTranslationPrompt();
+    setNativeTextareaValue(input, prompt);
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: prompt }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+
+    const ready = await waitForCondition(() => {
+      const submit = findChatSubmit(input, chatPanel, document, state.root);
+      return Boolean(submit && !submit.disabled);
+    }, 6000, 100);
+    if (!ready) throw new Error("NotebookLM 未能启用发送按钮，请确认页面已加载完成。");
+    const submit = findChatSubmit(input, chatPanel, document, state.root);
+    if (!submit) throw new Error("未找到 NotebookLM 对话发送按钮，请刷新页面后重试。");
+    submit.click();
+    return waitForNotebookAiJson(chatPanel || document, knownPayloads);
+  }
+
+  function setNativeTextareaValue(textarea, value) {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");
+    if (!descriptor || typeof descriptor.set !== "function") throw new Error("无法写入 NotebookLM 对话框。");
+    descriptor.set.call(textarea, value);
+  }
+
+  async function waitForNotebookAiJson(chatPanel, knownPayloads) {
+    const deadline = Date.now() + AI_TRANSLATION_TIMEOUT_MS;
+    let stableRaw = "";
+    let stableSince = 0;
+    while (Date.now() < deadline) {
+      const candidates = getAiResponseTexts(chatPanel)
+        .flatMap((text) => extractJsonArrayCandidates(text))
+        .filter((item) => !knownPayloads.has(item.raw))
+        .filter((item) => item.value.some((row) => {
+          const candidate = row as { source_name?: unknown; zh?: unknown } | null;
+          return Boolean(candidate && typeof candidate.source_name === "string" &&
+            typeof candidate.zh === "string" && candidate.zh.trim() &&
+            !["完整中文翻译", "完整简体中文翻译"].includes(candidate.zh.trim()));
+        }));
+      const newest = candidates[candidates.length - 1];
+      if (newest) {
+        if (newest.raw !== stableRaw) {
+          stableRaw = newest.raw;
+          stableSince = Date.now();
+        } else if (Date.now() - stableSince >= AI_TRANSLATION_SETTLE_MS) {
+          return newest.value;
+        }
+      }
+      await wait(AI_TRANSLATION_POLL_MS);
+    }
+    throw new Error("等待 NotebookLM AI 翻译超时，未收到完整 JSON 结果。");
+  }
+
+  function waitForCondition(check, timeoutMs, intervalMs) {
+    const deadline = Date.now() + timeoutMs;
+    return new Promise((resolve) => {
+      const poll = () => {
+        if (check()) return resolve(true);
+        if (Date.now() >= deadline) return resolve(false);
+        window.setTimeout(poll, intervalMs);
+      };
+      poll();
+    });
+  }
+
+  async function registerToSheet() {
+    const available = getSuccessfulRecords();
+    if (!available.length) {
+      setStage("请先提取转录");
+      return;
+    }
+    const settings = await extensionClient.getSettings();
+    const databaseUrl = panelQuery<HTMLInputElement>("[data-role='database-url']").value.trim();
+    if (databaseUrl !== settings.databaseUrl) {
+      await extensionClient.saveDatabaseUrl(databaseUrl);
+    }
+    if (!validDeploymentUrl(settings.deploymentUrl)) {
+      setStage("请先在插件图标中保存有效的 Apps Script /exec 部署链接");
+      return;
+    }
+    if (!validDatabaseUrl(databaseUrl)) {
+      setStage("请填写含 gid 的 Google 表格编辑链接");
+      return;
+    }
+
+    state.isBusy = true;
+    state.bottomOpen = true;
+    state.bottomView = "logs";
+    setStage("正在登记表格…");
+    state.logs = [];
+    addLog("请求已发送，等待表格服务响应。", "登记");
+    render();
+    const records = toSheetRecords(available, sourceNameToPostId);
+    const totalBatches = Math.ceil(records.length / SHEET_REGISTRATION_BATCH_SIZE);
+    const statusCounts = Object.create(null);
+    const failureLogs: Array<{ title: string; message: string }> = [];
+    let totalSuccess = 0;
+    let totalFailed = 0;
+
+    try {
+      for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
+        const batchStart = batchIndex * SHEET_REGISTRATION_BATCH_SIZE;
+        const batchRecords = records.slice(batchStart, batchStart + SHEET_REGISTRATION_BATCH_SIZE);
+        const batchLabel = `${batchIndex + 1}/${totalBatches}`;
+        setStage(`正在登记批次 ${batchLabel}（${batchRecords.length} 条）…`);
+        addLog(`批次 ${batchLabel} 已发送，共 ${batchRecords.length} 条。`, "登记");
+        render();
+
+        try {
+          const result = await callSheetUpsert(databaseUrl, batchRecords);
+          const analysis = analyzeBatchResponse(result as any, batchRecords, { batchStart, batchLabel });
+          mergeStatusCounts(statusCounts, analysis.statusCounts);
+          totalSuccess += analysis.success;
+          totalFailed += analysis.failed;
+          failureLogs.push(...analysis.failureLogs);
+          if (analysis.requestFailed) {
+            addLog(`批次 ${batchLabel} 请求失败，已继续下一批。`, "登记失败");
+            continue;
+          }
+          addLog(`批次 ${batchLabel} 完成：成功 ${analysis.success}，失败 ${analysis.failed}。`, "批次汇总");
+        } catch (error) {
+          const details = error.details || {};
+          totalFailed += batchRecords.length;
+          addStatusCount(statusCounts, "request_failed", batchRecords.length);
+          failureLogs.push({
+            title: `批次 ${batchLabel} 请求失败`,
+            message: [
+              `error.code: ${details.code || "REQUEST_FAILED"}`,
+              `http_status: ${details.http_status || "未知"}`,
+              `message: ${error.message || String(error)}`,
+              details.response_preview ? `response_preview: ${details.response_preview}` : "",
+              `未登记 post_id：${batchRecords.map((record) => record.post_id).join("、")}`
+            ].filter(Boolean).join("\n")
+          });
+          addLog(`批次 ${batchLabel} 请求异常，已继续下一批。`, "登记失败");
+        }
+        render();
+      }
+
+      const logTime = new Date().toLocaleTimeString();
+      const visibleFailures = failureLogs.slice(0, Math.max(0, MAX_LOGS - 3));
+      const hiddenFailureCount = failureLogs.length - visibleFailures.length;
+      state.logs = [
+        { message: formatStatusCounts(statusCounts), kind: "status_counts", time: logTime },
+        { message: `共 ${records.length} 条，${totalBatches} 批；成功 ${totalSuccess}，失败 ${totalFailed}。`, kind: "登记汇总", time: logTime },
+        ...(hiddenFailureCount ? [{ message: `失败明细较多，当前显示前 ${visibleFailures.length} 条，另有 ${hiddenFailureCount} 条未展开。`, kind: "显示限制", time: logTime }] : []),
+        ...visibleFailures.map((entry) => ({ message: entry.message, kind: entry.title, time: logTime }))
+      ].slice(0, MAX_LOGS);
+      setStage(`登记完成：成功 ${totalSuccess}，失败 ${totalFailed}`);
+    } finally {
+      state.isBusy = false;
+      render();
+    }
+  }
+
+  function callPageApi(action: NotebookAction, payload: Record<string, any>, timeoutMs: number) {
+    return callNotebookPageApi(action, payload, (stage) => {
+      if (/上传临时失败/.test(stage)) addLog(stage, "自动重试");
+      if (stage && !state.driveActivity.upload) setStage(stage);
+    }, timeoutMs);
+  }
+
+  function callSheetUpsert(databaseUrl, records) {
+    return extensionClient.upsertSheet({ databaseUrl, records });
+  }
+
+  async function copyTable() {
+    if (!getSuccessfulRecords().length) return setStage("没有成功的转录可复制");
+    try {
+      const rows = exportRows();
+      const plain = rows.map((row) => row.map((item) => String(item).replace(/\t/g, " ").replace(/\r?\n/g, " ↵ ")).join("\t")).join("\n");
+      const html = `<table border="1"><thead><tr>${rows[0].map((heading) => `<th>${escapeHtml(heading)}</th>`).join("")}</tr></thead><tbody>${rows.slice(1).map((row) => `<tr>${row.map((item) => `<td style="white-space:pre-wrap">${escapeHtml(item).replace(/\r?\n/g, "<br>")}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+      if (typeof ClipboardItem === "function") {
+        await navigator.clipboard.write([new ClipboardItem({ "text/plain": new Blob([plain], { type: "text/plain" }), "text/html": new Blob([html], { type: "text/html" }) })]);
+      } else {
+        await navigator.clipboard.writeText(plain);
+      }
+      setStage("已复制表格");
+    } catch (error) {
+      setStage("复制失败");
+      addLog(error.message || String(error), "失败");
+    }
+  }
+
+  function exportRows() {
+    const headers = state.translateEnabled
+      ? ["来源名", "完整转录文字", "中文翻译"]
+      : ["来源名", "完整转录文字"];
+    const rows = getSuccessfulRecords().map((record) => state.translateEnabled
+      ? [record.sourceName || "未命名来源", record.transcript || "", record.translation || ""]
+      : [record.sourceName || "未命名来源", record.transcript || ""]);
+    return [headers, ...rows];
+  }
+
+  function getSuccessfulRecords() {
+    return state.records.filter((record) => record.transcript && !record.error);
+  }
+
+  function sourceNameToPostId(sourceName: string) {
+    return stripSourceSuffix(sourceName);
+  }
+
+  function setStage(message) {
+    state.stage = message;
+    renderStatus();
+  }
+
+  function addLog(message, kind) {
+    state.logs.unshift({ message, kind, time: new Date().toLocaleTimeString() });
+    state.logs = state.logs.slice(0, MAX_LOGS);
+    renderBottomPanel();
+    renderLogs();
+  }
+
+  function render() {
+    if (!state.root) return;
+    state.root.classList.toggle("is-busy", state.isBusy);
+    state.root.classList.toggle("is-minimized", state.minimized);
+    const translateToggle = panelQuery<HTMLInputElement>("[data-role='translate-toggle']");
+    translateToggle.checked = state.translateEnabled;
+    translateToggle.disabled = state.isBusy;
+    const autoDeleteToggle = panelQuery<HTMLInputElement>("[data-role='auto-delete-toggle']");
+    autoDeleteToggle.checked = state.autoDeleteImported;
+    autoDeleteToggle.disabled = state.isBusy;
+    const autoRegisterToggle = panelQuery<HTMLInputElement>("[data-role='auto-register-toggle']");
+    autoRegisterToggle.checked = state.autoRegisterImported;
+    autoRegisterToggle.disabled = state.isBusy;
+    state.root.querySelectorAll<HTMLButtonElement>("button:not([data-action='minimize']):not([data-action='show-results']):not([data-action='show-logs']):not([data-action='toggle-bottom']):not([data-action='cancel-facebook'])").forEach((button) => { button.disabled = state.isBusy; });
+    const facebookCancel = panelQuery<HTMLButtonElement>("[data-action='cancel-facebook']");
+    facebookCancel.hidden = !state.facebookActive;
+    facebookCancel.disabled = !state.facebookActive || facebookPauseRequested;
+    const driveInput = panelQuery<HTMLTextAreaElement>("[data-role='drive-urls']");
+    if (driveInput) driveInput.disabled = state.isBusy;
+    state.root.querySelectorAll<HTMLButtonElement>("[data-action='switch-import']").forEach((button) => {
+      const active = button.dataset.mode === state.importMode;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", String(active));
+    });
+    panelQuery("[data-role='drive-pane']").toggleAttribute("hidden", state.importMode !== "drive");
+    panelQuery("[data-role='facebook-pane']").toggleAttribute("hidden", state.importMode !== "facebook");
+    const facebookImportButton = panelQuery<HTMLButtonElement>("[data-action='import-facebook']");
+    facebookImportButton.textContent = facebookJob && facebookJob.status !== "completed" && facebookJob.nextIndex > 0
+      ? `继续导入 ${facebookJob.nextIndex}/${facebookJob.tasks.length}`
+      : "开始导入";
+    const batchSizeInput = panelQuery<HTMLInputElement>("[data-role='drive-batch-size']");
+    if (batchSizeInput) {
+      batchSizeInput.value = String(state.driveBatchSize);
+      batchSizeInput.disabled = state.isBusy;
+    }
+    const minimizeButton = panelQuery<HTMLButtonElement>("[data-action='minimize']");
+    minimizeButton.title = "最小化";
+    minimizeButton.setAttribute("aria-label", "最小化");
+    const successCount = getSuccessfulRecords().length;
+    const failedCount = state.records.filter((record) => record.error || !record.transcript).length;
+    panelQuery("[data-role='record-count']").textContent = String(state.records.length);
+    panelQuery("[data-role='success-count']").textContent = String(successCount);
+    panelQuery("[data-role='failed-count']").textContent = String(failedCount);
+    panelQuery("[data-action='copy'] span").textContent = state.translateEnabled ? "复制三列结果" : "复制两列结果";
+    renderFacebookTable();
+    renderBottomPanel();
+    renderStatus();
+    renderLogs();
+    renderResults();
+  }
+
+  function renderStatus() {
+    if (!state.root) return;
+    const status = panelQuery("[data-role='status']");
+    if (status) status.textContent = state.stage;
+    const alert = panelQuery<HTMLElement>("[data-role='top-alert']");
+    const showAlert = isActionRequiredStage(state.stage);
+    alert.hidden = !showAlert;
+    alert.textContent = showAlert ? state.stage : "";
+  }
+
+  function isActionRequiredStage(message: string) {
+    return /失败|错误|异常|无法|无效|未启动|未连接|请先|请填写|请粘贴|需要修正|不能|超过|暂停|遗留|仍有|重试/u.test(message);
+  }
+
+  function renderLogs() {
+    if (!state.root) return;
+    const container = panelQuery("[data-role='logs']");
+    if (!container) return;
+    container.innerHTML = state.logs.length
+      ? state.logs.map((entry) => `<p><span>${escapeHtml(entry.kind)}</span>${escapeHtml(entry.message)}<time>${escapeHtml(entry.time)}</time></p>`).join("")
+      : "<div class=\"nlm-empty-state\">暂无操作日志。</div>";
+  }
+
+  function renderResults() {
+    if (!state.root) return;
+    const container = panelQuery("[data-role='results']");
+    if (!state.records.length) {
+      container.innerHTML = "<p>尚无来源记录。</p>";
+      return;
+    }
+    const visibleStart = Math.max(0, state.records.length - RESULT_RENDER_LIMIT);
+    const visibleRecords = state.records.slice(visibleStart);
+    const cards = visibleRecords.map((record, visibleIndex) => {
+      const index = visibleStart + visibleIndex;
+      const statusClass = record.error ? "is-error" : record.sourceDeleted ? "is-removed" : "is-ready";
+      const statusText = record.error ? "提取失败" : record.sourceDeleted ? "来源已移除" : "已提取";
+      const transcript = record.error
+        ? `<div class="nlm-result-error">${escapeHtml(record.error)}</div>`
+        : `<pre>${escapeHtml(record.transcript || "")}</pre>`;
+      const translation = state.translateEnabled
+        ? `<section class="nlm-result-content"><span>中文翻译</span>${record.translationError
+          ? `<div class="nlm-result-error">${escapeHtml(record.translationError)}</div>`
+          : `<pre>${escapeHtml(record.translation || "等待翻译…")}</pre>`}</section>`
+        : "";
+      return `<article class="nlm-result-card">
+        <header><div><b>${escapeHtml(record.sourceName || "未命名来源")}</b><small>来源 ${index + 1}</small></div><span class="nlm-result-status ${statusClass}">${statusText}</span></header>
+        <div class="nlm-result-grid ${state.translateEnabled ? "has-translation" : ""}">
+          <section class="nlm-result-content"><span>完整转录文字</span>${transcript}</section>
+          ${translation}
+        </div>
+      </article>`;
+    }).join("");
+    const limitNotice = visibleStart
+      ? `<div class="nlm-view-limit">结果共 ${state.records.length} 条，为保持流畅仅显示最近 ${visibleRecords.length} 条；复制和登记仍包含全部成功记录。</div>`
+      : "";
+    container.innerHTML = `${limitNotice}<div class="nlm-result-list">${cards}</div>`;
+  }
+
+  function renderBottomPanel() {
+    if (!state.root) return;
+    const panel = panelQuery(".nlm-bottom-panel");
+    if (!panel) return;
+    panel.classList.toggle("is-open", state.bottomOpen);
+    const resultButton = panel.querySelector<HTMLButtonElement>("[data-action='show-results']")!;
+    const logButton = panel.querySelector<HTMLButtonElement>("[data-action='show-logs']")!;
+    const toggleButton = panel.querySelector<HTMLButtonElement>("[data-action='toggle-bottom']")!;
+    const showingResults = state.bottomView === "results";
+    resultButton.classList.toggle("is-active", showingResults);
+    logButton.classList.toggle("is-active", !showingResults);
+    resultButton.setAttribute("aria-selected", String(showingResults));
+    logButton.setAttribute("aria-selected", String(!showingResults));
+    panel.querySelector("[data-role='results-view']")!.classList.toggle("is-active", showingResults);
+    panel.querySelector("[data-role='logs-view']")!.classList.toggle("is-active", !showingResults);
+    panel.querySelector("[data-role='result-tab-count']")!.textContent = String(state.records.length);
+    panel.querySelector("[data-role='log-tab-count']")!.textContent = String(state.logs.length);
+    toggleButton.textContent = state.bottomOpen ? "⌄" : "⌃";
+    toggleButton.title = state.bottomOpen ? "折叠底部面板" : "展开底部面板";
+    toggleButton.setAttribute("aria-label", toggleButton.title);
+  }
+
+  function switchBottomView(view) {
+    state.bottomView = view === "logs" ? "logs" : "results";
+    state.bottomOpen = true;
+    renderBottomPanel();
+  }
+
+  function toggleBottomPanel() {
+    state.bottomOpen = !state.bottomOpen;
+    renderBottomPanel();
+  }
+
+  function clearRecords() {
+    const count = state.records.length;
+    state.records = [];
+    facebookJob = null;
+    if (activeNotebookId) void extensionClient.clearFacebookJob(activeNotebookId);
+    setStage(count ? `已清除 ${count} 条记录，可重新提取` : "当前没有可清除的记录");
+    if (count) addLog(`已手动清除 ${count} 条会话记录；下次提取将重新读取全部来源。`, "清除");
+    render();
+  }
+
+  function escapeHtml(value) {
+    return String(value || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+  }
+
+  function toggleMinimized() {
+    if (!state.minimized) rememberPanelLayout();
+    state.minimized = !state.minimized;
+    render();
+    savePanelSettings();
+  }
+
+  function bindPanelDrag() {
+    const header = state.root.querySelector(".nlm-register-header");
+    const orb = state.root.querySelector(".nlm-orb");
+    bindDragHandle(header, false);
+    bindDragHandle(orb, true);
+  }
+
+  function bindDragHandle(handle, allowInteractive) {
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || (!allowInteractive && event.target.closest("button, label, input"))) return;
+      const rect = state.root.getBoundingClientRect();
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startLeft = rect.left;
+      const startTop = rect.top;
+      state.root.style.left = `${startLeft}px`;
+      state.root.style.top = `${startTop}px`;
+      state.root.style.right = "auto";
+      handle.setPointerCapture(event.pointerId);
+      let moved = false;
+
+      const move = (moveEvent) => {
+        if (Math.abs(moveEvent.clientX - startX) > 3 || Math.abs(moveEvent.clientY - startY) > 3) moved = true;
+        const maxLeft = Math.max(0, window.innerWidth - state.root.offsetWidth);
+        const maxTop = Math.max(0, window.innerHeight - state.root.offsetHeight);
+        state.root.style.left = `${Math.min(maxLeft, Math.max(0, startLeft + moveEvent.clientX - startX))}px`;
+        state.root.style.top = `${Math.min(maxTop, Math.max(0, startTop + moveEvent.clientY - startY))}px`;
+      };
+      const end = () => {
+        handle.removeEventListener("pointermove", move);
+        handle.removeEventListener("pointerup", end);
+        handle.removeEventListener("pointercancel", end);
+        state.suppressClick = allowInteractive && moved;
+        rememberPanelLayout();
+        savePanelSettings();
+      };
+      handle.addEventListener("pointermove", move);
+      handle.addEventListener("pointerup", end);
+      handle.addEventListener("pointercancel", end);
+    });
+  }
+
+  function bindPanelResizePersistence() {
+    if (typeof ResizeObserver !== "function") return;
+    let timerId = 0;
+    const observer = new ResizeObserver(() => {
+      clearTimeout(timerId);
+      timerId = window.setTimeout(() => {
+        if (state.minimized) return;
+        rememberPanelLayout();
+        savePanelSettings();
+      }, 250);
+    });
+    observer.observe(state.root);
+  }
+
+  function bindDatabaseUrlInput() {
+    const input = panelQuery<HTMLInputElement>("[data-role='database-url']");
+    const saveState = panelQuery<HTMLElement>("[data-role='sheet-save-state']");
+    let timerId = 0;
+    const save = async () => {
+      clearTimeout(timerId);
+      state.databaseUrl = input.value.trim();
+      await extensionClient.saveDatabaseUrl(state.databaseUrl);
+      const valid = validDatabaseUrl(state.databaseUrl);
+      input.classList.toggle("is-invalid", Boolean(state.databaseUrl) && !valid);
+      saveState.textContent = !state.databaseUrl ? "等待填写" : valid ? "已缓存" : "格式待检查";
+      saveState.classList.toggle("is-error", Boolean(state.databaseUrl) && !valid);
+    };
+    input.addEventListener("input", () => {
+      state.databaseUrl = input.value.trim();
+      saveState.textContent = "正在缓存…";
+      saveState.classList.remove("is-error");
+      clearTimeout(timerId);
+      timerId = window.setTimeout(save, 450);
+    });
+    input.addEventListener("blur", save);
+    const initialValid = validDatabaseUrl(state.databaseUrl);
+    input.classList.toggle("is-invalid", Boolean(state.databaseUrl) && !initialValid);
+    saveState.textContent = !state.databaseUrl ? "等待填写" : initialValid ? "已缓存" : "格式待检查";
+    saveState.classList.toggle("is-error", Boolean(state.databaseUrl) && !initialValid);
+  }
+
+  function rememberPanelLayout() {
+    const rect = state.root.getBoundingClientRect();
+    const layout = {
+      ...(state.panelLayout || {}),
+      left: Math.round(rect.left),
+      top: Math.round(rect.top)
+    };
+    if (!state.minimized) {
+      layout.width = Math.round(rect.width);
+      layout.height = Math.round(rect.height);
+    }
+    state.panelLayout = layout;
+  }
+
+  function restorePanelLayout() {
+    const layout = state.panelLayout;
+    if (!layout) return;
+    if (typeof layout.width === "number" && Number.isFinite(layout.width)) state.root.style.width = `${Math.max(300, Math.min(layout.width, window.innerWidth - 16))}px`;
+    if (typeof layout.height === "number" && Number.isFinite(layout.height)) state.root.style.height = `${Math.max(320, Math.min(layout.height, window.innerHeight - 16))}px`;
+    const panelWidth = Math.min(Number(layout.width) || state.root.offsetWidth || 390, window.innerWidth - 16);
+    const panelHeight = Math.min(Number(layout.height) || state.root.offsetHeight || 760, window.innerHeight - 16);
+    if (typeof layout.left === "number" && Number.isFinite(layout.left)) {
+      state.root.style.left = `${Math.max(8, Math.min(layout.left, window.innerWidth - panelWidth - 8))}px`;
+      state.root.style.right = "auto";
+    }
+    if (typeof layout.top === "number" && Number.isFinite(layout.top)) {
+      state.root.style.top = `${Math.max(8, Math.min(layout.top, window.innerHeight - panelHeight - 8))}px`;
+    }
+    keepPanelInViewport();
+  }
+
+  function keepPanelInViewport() {
+    if (!state.root?.isConnected || state.minimized) return;
+    const rect = state.root.getBoundingClientRect();
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - rect.width - 8));
+    const top = Math.max(8, Math.min(rect.top, window.innerHeight - rect.height - 8));
+    if (Math.abs(left - rect.left) > 1) {
+      state.root.style.left = `${left}px`;
+      state.root.style.right = "auto";
+    }
+    if (Math.abs(top - rect.top) > 1) state.root.style.top = `${top}px`;
+  }
+
+  async function savePanelSettings() {
+    const settings: PanelSettings = {
+      aiTranslationEnabled: state.translateEnabled,
+      autoDeleteImported: state.autoDeleteImported,
+      autoRegisterImported: state.autoRegisterImported,
+      driveBatchSize: state.driveBatchSize,
+      importMode: state.importMode,
+      facebookImportOpen: state.importMode === "facebook",
+      facebookAutoRegister: state.autoRegisterImported,
+      minimized: state.minimized,
+      layout: state.panelLayout || {}
+    };
+    await extensionClient.savePanelSettings(settings);
+  }
+
+  function brandIconMarkup(className) {
+    return `<img class="${className}" data-extension-icon src="${extensionResources.iconUrl || fallbackIconDataUrl()}" alt="">`;
+  }
+
+  function fallbackIconDataUrl() {
+    return "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='18' y1='12' x2='112' y2='118' gradientUnits='userSpaceOnUse'%3E%3Cstop stop-color='%236D5DFB'/%3E%3Cstop offset='1' stop-color='%233457D5'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='8' y='8' width='112' height='112' rx='34' fill='url(%23g)'/%3E%3Cpath d='M36 86V47c0-4.4 5.2-6.8 8.6-4l38 32.6V42' fill='none' stroke='white' stroke-width='12' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='94' cy='92' r='12' fill='%235EEAD4' stroke='white' stroke-width='4'/%3E%3C/svg%3E";
+  }

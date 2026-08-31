@@ -1,0 +1,25 @@
+{
+  "name": "notebooklm-transcript-helper",
+  "description": "NotebookLM 转录登记",
+  "private": true,
+  "version": "0.11.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "rimraf dist && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@crxjs/vite-plugin": "^2.2.1",
+    "@types/chrome": "^0.1.27",
+    "@types/node": "^24.10.0",
+    "@webextkits/storage-local": "^1.0.0",
+    "ajv": "^8.17.1",
+    "rimraf": "^6.1.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.1"
+  }
+}

@@ -2,9 +2,15 @@
 
 这是一个本地加载的 Chrome/Edge 扩展：把公开的 Google Drive 音视频批量加入当前 NotebookLM 笔记本，逐个读取来源转录稿，可选通过 NotebookLM AI 翻译为中文，并把结果登记到你的 Google Sheets 数据库服务。
 
-> 当前版本：[`v0.10.0`](https://github.com/secure-artifacts/notebooklm-/releases/tag/v0.10.0) · 下载并解压 Release 中的 ZIP 后，在浏览器扩展管理页使用「加载已解压的扩展程序」导入。
+> 当前开发版本：`v0.11.0` · 发布后下载并解压 Release 中的 ZIP，在浏览器扩展管理页使用「加载已解压的扩展程序」导入。
 
 ## 最新更新
+
+### v0.11.0（待发布）
+
+- 完整迁移到 TypeScript、Vite 与 WebExtKits 分层架构。
+- 增加可恢复的 Facebook/Colab 批量导入、千条任务队列和每批自动登记。
+- 固定 Colab 运行依赖，校验下载二进制，并限制单个媒体文件大小。
 
 ### v0.10.0
 
@@ -28,6 +34,10 @@
 
 - 提取每个已有来源的名称和完整转录文字。
 - 粘贴多个公开 Google Drive 文件链接，自动识别音频/视频；默认每批处理 10 个，可在 1–25 之间调整。批内固定采用最多 3 路受控下载/上传并发，临时网络错误自动重试；每批提取并清理成功来源后继续下一批，所有批次结束后再统一执行可选翻译。
+- Facebook 队列一次最多接受 `1000` 条公开链接，固定每批最多 `20` 条；批次进度、结果和未完成来源 ID 会持久保存，页面刷新或 Colab 中断后可从安全检查点继续。
+- Drive 与 Facebook 使用标签页切换，避免两个导入区同时占据面板。自动移除、自动登记和来源清理是两种导入方式共用的设置。
+- Facebook 使用“贴文 ID、链接、状态”表格编辑器；支持从 Excel/Google Sheets 直接粘贴两列、复选多行和批量删除，并逐行校验空 ID、无效链接及重复项。
+- 「每批自动登记表格」默认关闭；开启时会先同时校验 Apps Script 部署链接和含 `gid` 的表格链接。Drive 或 Facebook 每批转录完成后自动登记，登记失败不会中断后续导入。
 - 浮动面板只在具体笔记本页面显示；兼容 `notebooklm.google.com/notebook/...` 与 `notebook.google.com/notebook/...` 两种地址；扩展图标弹窗可直接打开 NotebookLM 首页。
 - Drive 导入不需要 OAuth，不读取登录 Cookie；文件必须设置为“知道链接的任何人可查看”并允许下载。
 - 默认在本次导入来源成功取得转录后自动将其从 NotebookLM 移除，释放每个笔记本的来源名额；失败来源会保留以便重试。
@@ -73,34 +83,43 @@ Content-Type: application/json
 
 ## 使用流程
 
-1. 在 `chrome://extensions`（或 Edge 的 `edge://extensions`）开启开发者模式，并加载本文件夹。
+1. 使用 Release ZIP 时先解压；本地源码首次运行时执行 `npm ci && npm run build`。然后在 `chrome://extensions`（或 Edge 的 `edge://extensions`）开启开发者模式，选择「加载已解压的扩展程序」并加载解压目录或本项目的 `dist` 目录。不要直接加载源码根目录。
 2. 打开 NotebookLM 笔记本并刷新页面。
 3. 如需导入 Drive 文件，展开「Drive 音视频导入」，每行粘贴一个公开文件链接，设置每批数量后点击「开始导入」。扩展会验证响应确实是音频或视频，其他文件会被拒绝。每批内部固定使用最多 `3` 路受控并发；下载或上传遇到可恢复的网络错误时最多尝试 `3` 次。该批完成提取和来源清理后，才进入下一批。
    - 每批默认 `10` 个，可在 `1–25` 之间调整并自动缓存。链接很多或笔记本已有较多来源时，可减小批量。
    - 「自动移除导入来源」默认开启，只删除本次导入且已成功取得转录的来源；关闭后会保留来源。
    - 「清空来源」会永久移除当前笔记本全部来源，执行前必须再次确认。
-4. 如需读取笔记本中全部现有来源，在面板点击「提取转录」。
-5. 如需中文翻译，勾选「AI 翻译」；可在提取前或提取后勾选。开启后，导入批次会在自动移除来源前完成 AI 翻译；翻译失败的来源会保留以便重试。
-6. 需要写入时点击「登记表格」；需要手工粘贴时点击「复制」。
+4. 如需导入 Facebook 公开视频，切换到 Facebook 标签，先从扩展图标启动并等待唯一的 Colab 临时后端就绪，再在任务表填写贴文 ID 和公开链接。可从 Excel/Google Sheets 直接粘贴两列；第三列会显示下载、上传、等待转录、完成或失败状态。一次最多 `1000` 条，每批最多 `20` 条。
+   - 建议保持「自动移除导入来源」开启，批次结束后会释放来源名额。关闭时，扩展会读取当前来源数量；待导入数量超过笔记本剩余的 `50` 个来源名额时会直接阻止启动并显示差额。
+   - 「每批自动登记表格」默认关闭。开启前必须填写有效 Apps Script 部署链接和含 `gid` 的表格链接。
+   - 点击“暂停”会在当前批次完成并保存检查点后停止。页面或浏览器意外中断时，重新打开同一笔记本可继续；开启自动移除时会先精确清理未提交批次，避免重复来源。
+5. 如需读取笔记本中全部现有来源，在面板点击「提取转录」。
+6. 如需中文翻译，勾选「AI 翻译」；可在提取前或提取后勾选。开启后，导入批次会在自动移除来源前完成 AI 翻译；翻译失败的来源会保留以便重试。
+7. 需要写入时点击「登记表格」；需要手工粘贴时点击「复制」。
 
 ## 项目结构与测试
 
-- `src/content.js`：扩展面板、导入与翻译流程编排。
-- `src/modules/notebook-dom.js`：NotebookLM 来源选择、对话输入框、发送按钮和 AI 回复的页面适配。
-- `src/modules/ai-translation-utils.js`：来源名标准化、提示词、JSON 解析与翻译结果合并。
-- `src/page-hook.js`：在 NotebookLM 页面主环境中调用来源相关请求。
-- `src/drive-loader.js`：公开 Drive 音视频下载与类型验证。
-- `tests/`：不访问网络的 Node.js 单元测试。
+- `src/manifest.ts`：Manifest V3 的唯一源码，由构建生成 `dist/manifest.json`。
+- `src/scopes/content/`：隔离世界中的悬浮面板启动、设置访问、流程编排客户端和页面桥客户端。
+- `src/scopes/injects/notebook/`：MAIN world 中最小化的 NotebookLM 页面请求适配与消息桥；面板不会依赖它才能显示。
+- `src/scopes/background/`：私有部署配置和 Google Sheets 跨域登记。
+- `src/scopes/drive-loader/`：公开 Drive 音视频匿名下载与类型验证。
+- `src/scopes/popup/`：扩展图标弹窗与 Apps Script 部署链接配置。
+- `src/lib/`：可独立测试的 AI 翻译、DOM、Drive、NotebookLM 响应和登记算法。
+- `src/schema/`、`src/types/`：WebExtKits 存储 schema 与消息/领域类型。
+- `tests/`：不访问网络的 TypeScript 单元测试。
+- `dist/`：唯一可加载和发布的构建产物，不手工编辑。
 
 本地检查：
 
 ```bash
-node --test tests/*.test.js
-node --check src/content.js
-node --check src/page-hook.js
+npm ci
+npm run check
 ```
 
-Release 工作流会先运行单元测试，测试通过后才打包扩展。新模块位于 `src/` 下，会自动包含在最终 ZIP 中。
+项目已完整迁移到 TypeScript/Vite，并使用 WebExtKits storage-local 管理类型化设置，不再并行维护旧版 JavaScript 架构。UI、NotebookLM 页面请求和 Background 权限严格分层；`npm run check` 会依次执行严格类型检查、全部单元测试和 Vite 生产构建。完整边界说明见 [`docs/architecture.md`](docs/architecture.md)。
+
+Release 工作流使用锁定依赖执行同一套检查，只打包 `dist/` 的内容；最终 ZIP 根目录直接包含 `manifest.json`。Apps Script 部署链接只保存在扩展存储并由 Background 使用，不会发送到 NotebookLM 页面环境。
 
 ## 隐私与限制
 
@@ -129,19 +148,21 @@ git push origin main
 
 #### 2. 创建并推送版本 Tag
 
-版本号使用 `v主版本.次版本.修订版本` 格式，例如 `v0.10.0`。
+版本号使用 `v主版本.次版本.修订版本` 格式，例如 `v0.11.0`。工作流会拒绝与扩展 manifest 版本不一致的 Tag。
 
 ```bash
-git tag -a v0.10.0 -m "Release version 0.10.0"
-git push origin v0.10.0
+git tag -a v0.11.0 -m "Release version 0.11.0"
+git push origin v0.11.0
 ```
 
 推送后，GitHub Actions 会自动：
 
-1. 校验扩展的 `manifest.json`。
-2. 打包根目录包含 `manifest.json` 的 ZIP 文件。
-3. 为最终 ZIP 生成 Attestation。
-4. 创建 GitHub Release 并由 `github-actions[bot]` 上传 ZIP。
+1. 使用 `npm ci` 安装锁定版本依赖。
+2. 执行 TypeScript 类型检查、全部单元测试和生产构建。
+3. 校验构建生成的 `dist/manifest.json`。
+4. 将 `dist/` 打包为根目录包含 `manifest.json` 的 ZIP。
+5. 为最终 ZIP 生成 Attestation。
+6. 创建 GitHub Release 并由 `github-actions[bot]` 上传 ZIP。
 
 #### 3. 查看结果
 
@@ -155,8 +176,8 @@ git push origin v0.10.0
 3. 重新创建相同版本的 Tag 并推送：
 
 ```bash
-git tag -d v0.10.0
-git push origin :refs/tags/v0.10.0
-git tag -a v0.10.0 -m "Release version 0.10.0"
-git push origin v0.10.0
+git tag -d v0.11.0
+git push origin :refs/tags/v0.11.0
+git tag -a v0.11.0 -m "Release version 0.11.0"
+git push origin v0.11.0
 ```
