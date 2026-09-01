@@ -5,6 +5,7 @@ export const panelSettingsSchema: JSONSchemaType<PanelSettings> = {
   type: "object",
   properties: {
     aiTranslationEnabled: { type: "boolean", default: false },
+    aiTranslationBatchSize: { type: "number", default: 5 },
     autoDeleteImported: { type: "boolean", default: true },
     autoRegisterImported: { type: "boolean", default: false },
     driveBatchSize: { type: "number", default: 10 },
@@ -25,7 +26,7 @@ export const panelSettingsSchema: JSONSchemaType<PanelSettings> = {
       }
     }
   },
-  required: ["aiTranslationEnabled", "autoDeleteImported", "autoRegisterImported", "driveBatchSize", "importMode", "facebookImportOpen", "facebookAutoRegister", "minimized", "layout"],
+  required: ["aiTranslationEnabled", "aiTranslationBatchSize", "autoDeleteImported", "autoRegisterImported", "driveBatchSize", "importMode", "facebookImportOpen", "facebookAutoRegister", "minimized", "layout"],
   default: {}
 };
 

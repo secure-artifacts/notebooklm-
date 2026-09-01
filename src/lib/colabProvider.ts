@@ -18,6 +18,7 @@ export type ColabBridgeEvent =
       session_id: string;
       base_url: string;
       token: string;
+      capabilities?: string[];
     }
   | {
       event_id: string;
@@ -59,6 +60,15 @@ export type FacebookTableInput = { postId: string; url: string };
 export type FacebookTableIssue = { index: number; message: string };
 export type FacebookTableParseResult = FacebookTaskParseResult & { issues: FacebookTableIssue[] };
 export type FacebookClipboardRow = FacebookTableInput & { twoColumns: boolean };
+
+export function isFacebookTableRowPopulated(row: FacebookTableInput): boolean {
+  return Boolean(String(row?.postId || "").trim() || String(row?.url || "").trim());
+}
+
+export function shouldAppendFacebookEditorRow(rows: FacebookTableInput[], maxRows = 1000): boolean {
+  if (!rows.length) return true;
+  return rows.length < maxRows && isFacebookTableRowPopulated(rows[rows.length - 1]);
+}
 
 const facebookHosts = new Set([
   "facebook.com",
@@ -102,7 +112,7 @@ export function parseFacebookTableRows(rows: FacebookTableInput[], maxTasks = 10
   rows.forEach((row, index) => {
     const rawPostId = String(row?.postId || "").trim();
     const rawUrl = String(row?.url || "").trim();
-    if (!rawPostId && !rawUrl) return;
+    if (!isFacebookTableRowPopulated(row)) return;
     if (tasks.length >= maxTasks) {
       issues.push({ index, message: `一次最多 ${maxTasks} 条。` });
       return;
@@ -318,6 +328,12 @@ export function normalizeGradioControlUrl(value: unknown): string {
   } catch {
     return "";
   }
+}
+
+export function supportsColabShutdown(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const capabilities = (value as { capabilities?: unknown }).capabilities;
+  return Array.isArray(capabilities) && capabilities.includes("shutdown");
 }
 
 export function parseGradioSseData(body: string): unknown[] {

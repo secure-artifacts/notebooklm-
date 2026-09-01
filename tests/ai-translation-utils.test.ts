@@ -8,6 +8,13 @@ test("stripSourceSuffix removes media suffixes and URL decorations", () => {
   assert.equal(utils.stripSourceSuffix("#123456"), "#123456");
 });
 
+test("AI translation batch size is clamped between 1 and 20", () => {
+  assert.equal(utils.normalizeAiTranslationBatchSize(""), 5);
+  assert.equal(utils.normalizeAiTranslationBatchSize(0), 1);
+  assert.equal(utils.normalizeAiTranslationBatchSize(7), 7);
+  assert.equal(utils.normalizeAiTranslationBatchSize(99), 20);
+});
+
 test("sourceNamesMatch ignores suffix, case and repeated whitespace", () => {
   assert.equal(utils.sourceNamesMatch("My   Audio.mp3", "my audio.MP3"), true);
   assert.equal(utils.sourceNamesMatch("first.mp3", "second.mp3"), false);

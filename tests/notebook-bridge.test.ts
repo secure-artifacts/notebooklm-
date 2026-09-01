@@ -20,3 +20,12 @@ test("Notebook bridge bounds source lists", () => {
   assert.equal(isSafeNotebookPayload("extract-existing-sources", { sourceIds: ids }), false);
   assert.equal(isSafeNotebookPayload("extract-existing-sources", { skipSourceIds: ["source_001"] }), true);
 });
+
+test("Notebook bridge allows a large deduplication list without widening operation batches", () => {
+  const thousandIds = Array.from({ length: 1000 }, (_, index) => `source_${String(index).padStart(4, "0")}`);
+  assert.equal(isSafeNotebookPayload("extract-existing-sources", { skipSourceIds: thousandIds }), true);
+  assert.equal(isSafeNotebookPayload("extract-existing-sources", {
+    skipSourceIds: [...thousandIds, "source_1000"]
+  }), false);
+  assert.equal(isSafeNotebookPayload("extract-existing-sources", { sourceIds: thousandIds }), false);
+});

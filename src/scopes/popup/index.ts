@@ -6,6 +6,7 @@ const storage = useStorageLocal<SchemaType>(schema);
 const deploymentInput = document.getElementById("deploymentUrl") as HTMLInputElement;
 const status = document.getElementById("status") as HTMLParagraphElement;
 const startColabButton = document.getElementById("startColab") as HTMLButtonElement;
+const stopColabButton = document.getElementById("stopColab") as HTMLButtonElement;
 
 void Promise.all([loadSettings(), loadRuntimeStatus()]);
 
@@ -17,9 +18,9 @@ startColabButton.addEventListener("click", async () => {
   startColabButton.disabled = true;
   showStatus("正在检查浏览器中的 Colab 临时后端…");
   try {
-    const result = await sendBackground("startColabRuntime", {}) as { ready?: boolean; restarted?: boolean; state?: string };
+    const result = await sendBackground("startColabRuntime", {}) as { ready?: boolean; restarted?: boolean; state?: string; canStop?: boolean };
     if (result.ready) {
-      setRuntimeButton("ready");
+      setRuntimeButton("ready", result.canStop === true);
       showStatus("Colab 临时后端已就绪，已切换到唯一后端标签。");
     } else {
       setRuntimeButton("starting");
@@ -30,6 +31,24 @@ startColabButton.addEventListener("click", async () => {
     showStatus(error instanceof Error ? error.message : String(error), true);
   } finally {
     startColabButton.disabled = false;
+  }
+});
+
+stopColabButton.addEventListener("click", async () => {
+  startColabButton.disabled = true;
+  stopColabButton.disabled = true;
+  showStatus("正在通知 Colab 结束运行时…");
+  try {
+    const result = await sendBackground("stopColabRuntime", {}) as { stopped?: boolean; alreadyStopped?: boolean };
+    if (!result.stopped) throw new Error("Colab 未确认结束请求。");
+    setRuntimeButton("stopped");
+    showStatus(result.alreadyStopped ? "Colab 后端已经停止。" : "Colab 运行时已结束，后端标签已关闭。");
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : String(error), true);
+    await loadRuntimeStatus();
+  } finally {
+    startColabButton.disabled = false;
+    stopColabButton.disabled = false;
   }
 });
 
@@ -49,8 +68,8 @@ async function loadSettings() {
 
 async function loadRuntimeStatus() {
   try {
-    const result = await sendBackground("getColabRuntimeStatus", {}) as { state?: string; label?: string; error?: string };
-    setRuntimeButton(String(result.state || "stopped"));
+    const result = await sendBackground("getColabRuntimeStatus", {}) as { state?: string; label?: string; error?: string; canStop?: boolean };
+    setRuntimeButton(String(result.state || "stopped"), result.canStop === true);
     if (result.state && result.state !== "stopped") {
       showStatus(`Colab 后端：${result.label || result.state}${result.error ? `（${result.error}）` : ""}`, result.state === "failed" || result.state === "stale");
     }
@@ -59,11 +78,12 @@ async function loadRuntimeStatus() {
   }
 }
 
-function setRuntimeButton(state: string) {
-  if (state === "ready") startColabButton.textContent = "打开已就绪的 Colab 后端";
-  else if (state === "starting") startColabButton.textContent = "打开正在启动的 Colab 后端";
-  else if (state === "stale" || state === "failed") startColabButton.textContent = "重新启动 Colab 临时后端";
-  else startColabButton.textContent = "启动 Colab 临时后端";
+function setRuntimeButton(state: string, canStop = false) {
+  stopColabButton.hidden = state !== "ready" || !canStop;
+  if (state === "ready") startColabButton.textContent = "打开 Colab 后端";
+  else if (state === "starting") startColabButton.textContent = "查看启动进度";
+  else if (state === "stale" || state === "failed") startColabButton.textContent = "重启 Colab 后端";
+  else startColabButton.textContent = "启动 Colab 后端";
 }
 
 function isDeploymentUrl(value) {

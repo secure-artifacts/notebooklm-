@@ -19,7 +19,11 @@
       input:focus { border-color: #6869df; box-shadow: 0 0 0 3px rgba(104,105,223,.12); }
       button { background: linear-gradient(135deg, #6262e8, #4c50ce); border: 0; border-radius: 9px; box-shadow: 0 5px 14px rgba(78,80,196,.2); color: #fff; cursor: pointer; font: 700 12px/1 "Segoe UI", "Microsoft YaHei", sans-serif; margin-top: 15px; min-height: 40px; width: 100%; }
       button:hover { filter: brightness(.98); }
-      #openNotebook { background: #fff; border: 1px solid #dfe2ec; box-shadow: none; color: #4d51ca; margin: 0 0 14px; }
+      .quick-actions { display: grid; gap: 9px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .quick-actions button { font-size: 11px; margin: 0; min-height: 42px; padding: 0 8px; }
+      #openNotebook { background: linear-gradient(135deg, #7474ed, #5b5fd9); }
+      #startColab { background: linear-gradient(135deg, #5e61df, #484dbf); }
+      #stopColab { background: #fff; border: 1px solid #efcfd4; box-shadow: none; color: #b64d59; margin-top: 9px; min-height: 32px; }
       #status { color: #397d70; font-size: 11px; line-height: 17px; margin: 9px 0 0; min-height: 17px; }
     </style>
   </head>
@@ -29,8 +33,11 @@
       <div><h1>NotebookLM 转录登记</h1><span>自动提取、翻译与表格写入</span></div>
     </header>
     <main>
-      <button type="button" id="openNotebook">打开 NotebookLM</button>
-      <button type="button" id="startColab">启动 / 打开 Colab 临时后端</button>
+      <div class="quick-actions">
+        <button type="button" id="openNotebook">打开 NotebookLM</button>
+        <button type="button" id="startColab">启动 Colab 后端</button>
+      </div>
+      <button type="button" id="stopColab" hidden>结束 Colab 后端</button>
       <label for="deploymentUrl">Apps Script 部署链接</label>
       <input id="deploymentUrl" type="url" placeholder="https://script.google.com/macros/s/.../exec">
       <button type="button" id="saveSettings">保存设置</button>

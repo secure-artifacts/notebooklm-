@@ -15,6 +15,9 @@ export const notebookBridgeActions = new Set<NotebookBridgeAction>([
   "delete-sources"
 ]);
 
+const MAX_OPERATION_SOURCE_IDS = 50;
+const MAX_SKIP_SOURCE_IDS = 1000;
+
 export function isBridgeIdentifier(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9_-]{8,100}$/u.test(value);
 }
@@ -24,14 +27,14 @@ export function isSafeNotebookPayload(action: NotebookBridgeAction, payload: unk
   const value = payload as Record<string, unknown>;
   if (action === "get-source-summary") return Object.keys(value).length === 0;
   if (action === "delete-sources") {
-    if (!Array.isArray(value.sourceIds) || value.sourceIds.length > 50 || !validSourceIds(value.sourceIds)) return false;
+    if (!Array.isArray(value.sourceIds) || value.sourceIds.length > MAX_OPERATION_SOURCE_IDS || !validSourceIds(value.sourceIds)) return false;
     return value.sourceIds.length > 0 || value.deleteAll === true;
   }
   if (action === "extract-existing-sources") {
     const sourceIds = value.sourceIds;
     const skipSourceIds = value.skipSourceIds;
-    return (sourceIds === undefined || (Array.isArray(sourceIds) && sourceIds.length <= 50 && validSourceIds(sourceIds))) &&
-      (skipSourceIds === undefined || (Array.isArray(skipSourceIds) && skipSourceIds.length <= 50 && validSourceIds(skipSourceIds)));
+    return (sourceIds === undefined || (Array.isArray(sourceIds) && sourceIds.length <= MAX_OPERATION_SOURCE_IDS && validSourceIds(sourceIds))) &&
+      (skipSourceIds === undefined || (Array.isArray(skipSourceIds) && skipSourceIds.length <= MAX_SKIP_SOURCE_IDS && validSourceIds(skipSourceIds)));
   }
   if (action === "prepare-remote-media-source") {
     return typeof value.fileName === "string" && value.fileName.length > 0 && value.fileName.length <= 255 &&

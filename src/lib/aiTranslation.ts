@@ -1,5 +1,15 @@
 import type { TranscriptRecord } from "@/types/domain";
 
+export const DEFAULT_AI_TRANSLATION_BATCH_SIZE = 5;
+export const MIN_AI_TRANSLATION_BATCH_SIZE = 1;
+export const MAX_AI_TRANSLATION_BATCH_SIZE = 20;
+
+export function normalizeAiTranslationBatchSize(value: unknown): number {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_AI_TRANSLATION_BATCH_SIZE;
+  return Math.max(MIN_AI_TRANSLATION_BATCH_SIZE, Math.min(MAX_AI_TRANSLATION_BATCH_SIZE, parsed));
+}
+
 export function stripSourceSuffix(sourceName: unknown): string {
   let value = String(sourceName || "").trim();
   const queryIndex = value.indexOf("?");
@@ -20,6 +30,7 @@ export function sourceNamesMatch(left: unknown, right: unknown): boolean {
 export function buildTranslationPrompt(): string {
   return [
     "请将当前选中的全部来源分别完整翻译成中国大陆通用的简体中文。",
+    "不需要研究，仅根据转录原文翻译即可。",
     "译文必须全部使用简体中文汉字，不得使用繁体中文或繁体字；人名、地名和专有名词也请使用常见的简体中文写法。",
     "不得概括、删减、合并来源。",
     "请仅输出合法 JSON 数组，不要使用 Markdown 代码块，不要解释。",

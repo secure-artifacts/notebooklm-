@@ -63,6 +63,36 @@ test("findChatInput supports the Traditional Chinese label fallback", () => {
   assert.equal(notebookDom.findChatInput(doc, null), input);
 });
 
+test("findChatInput ignores textareas rendered inside the extension panel", () => {
+  const pluginInput = createControl({ closest: () => null });
+  const realInput = createControl({ closest: () => null });
+  const chatPanel = {
+    querySelectorAll: (selector) => selector === "textarea" ? [pluginInput, realInput] : []
+  };
+  const doc = createDocument({
+    querySelector: (selector) => selector === ".chat-panel" ? chatPanel : null,
+    querySelectorAll: () => []
+  });
+  const panelRoot = { contains: (element) => element === pluginInput };
+
+  assert.equal(notebookDom.findChatInput(doc, panelRoot as any), realInput);
+});
+
+test("isNotebookAiGenerating detects the language-independent stop button structure", () => {
+  const stopButton = createControl({
+    classList: { contains: (name) => name === "stop-button" },
+    textContent: "stop"
+  });
+  const chatPanel = {
+    querySelectorAll: (selector) => selector === "button" ? [stopButton] : []
+  };
+  const doc = createDocument();
+
+  assert.equal(notebookDom.isNotebookAiGenerating(doc, chatPanel as any, null), true);
+  stopButton.hidden = true;
+  assert.equal(notebookDom.isNotebookAiGenerating(doc, chatPanel as any, null), false);
+});
+
 test("source selection can select a subset and restore the snapshot", () => {
   const firstCheckbox = createControl({ checked: true });
   const secondCheckbox = createControl({ checked: true });
@@ -151,4 +181,14 @@ test("getAiResponseTexts removes citation markers from cloned replies", () => {
     '[{"source_name":"A","zh":"中文"}]'
   ]);
   assert.equal(markerRemoved, true);
+});
+
+test("getUserMessageTexts reads submitted prompts independently from AI replies", () => {
+  const responseRoot = {
+    querySelectorAll: (selector) => selector === ".from-user-message-inner-content"
+      ? [{ querySelector: () => ({ textContent: "  prompt sent  " }) }]
+      : []
+  };
+
+  assert.deepEqual(notebookDom.getUserMessageTexts(responseRoot as any), ["prompt sent"]);
 });

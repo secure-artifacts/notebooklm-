@@ -6,7 +6,7 @@ import {
   runtimeStateLabel,
   type ColabRuntimeSnapshot
 } from "@/lib/colabRuntime";
-import { decodeColabControlValue } from "@/lib/colabProvider";
+import { decodeColabControlValue, supportsColabShutdown } from "@/lib/colabProvider";
 import { schema, type SchemaType } from "@/schema";
 import type { ColabApiRequest, SheetUpsertRequest } from "@/types/messages";
 import { useStorageLocal } from "@webextkits/storage-local";
@@ -31,6 +31,7 @@ const runtimeChannel = "nlm-transcript-background";
 const storage = useStorageLocal<SchemaType>(schema);
 const colabSessionEvents = new Map<string, { event: unknown; receivedAt: number }>();
 const COLAB_SESSION_EVENT_TTL_MS = 5 * 60 * 1000;
+const COLAB_SHUTDOWN_GRACE_MS = 3_500;
 
 type RuntimeRequest = {
   channel?: string;
@@ -100,6 +101,10 @@ async function handleRuntimeRequest(action: string | undefined, payload: any, se
     if (!isExtensionPageSender(sender)) throw new Error("Colab 启动请求来源无效。");
     return startSingletonColabRuntime();
   }
+  if (action === "stopColabRuntime") {
+    if (!isExtensionPageSender(sender)) throw new Error("Colab 结束请求来源无效。");
+    return stopSingletonColabRuntime();
+  }
   if (action === "getColabRuntimeStatus") {
     if (!isExtensionPageSender(sender)) throw new Error("Colab 状态查询来源无效。");
     return getColabRuntimeStatus();
@@ -109,11 +114,11 @@ async function handleRuntimeRequest(action: string | undefined, payload: any, se
   throw new Error("不支持的扩展后台请求。");
 }
 
-async function startSingletonColabRuntime(): Promise<{ tabId: number; ready: boolean; restarted: boolean; state: string }> {
+async function startSingletonColabRuntime(): Promise<{ tabId: number; ready: boolean; restarted: boolean; state: string; canStop?: boolean }> {
   return withColabStartLock(startSingletonColabRuntimeUnlocked);
 }
 
-async function startSingletonColabRuntimeUnlocked(): Promise<{ tabId: number; ready: boolean; restarted: boolean; state: string }> {
+async function startSingletonColabRuntimeUnlocked(): Promise<{ tabId: number; ready: boolean; restarted: boolean; state: string; canStop?: boolean }> {
   const [stored, helperTabs] = await Promise.all([readColabRuntime(), findColabHelperTabs()]);
   const target = findPreferredHelperTab(helperTabs, stored);
   const now = Date.now();
@@ -127,7 +132,7 @@ async function startSingletonColabRuntimeUnlocked(): Promise<{ tabId: number; re
         await writeColabRuntime({ tabId: target.id, sessionId, state: "ready", startedAt, lastSeenAt: now });
         await focusTab(target.id, target.windowId);
         await closeDuplicateColabTabs(helperTabs, target.id);
-        return { tabId: target.id, ready: true, restarted: false, state: "ready" };
+        return { tabId: target.id, ready: true, restarted: false, state: "ready", canStop: true };
       }
       const snapshot: ColabRuntimeSnapshot = {
         tabId: target.id,
@@ -164,6 +169,45 @@ async function startSingletonColabRuntimeUnlocked(): Promise<{ tabId: number; re
   });
   await closeDuplicateColabTabs(helperTabs, opened.id);
   return { tabId: opened.id, ready: false, restarted: Boolean(target), state: "starting" };
+}
+
+async function stopSingletonColabRuntime(): Promise<{ stopped: true; alreadyStopped?: boolean }> {
+  const [stored, helperTabs] = await Promise.all([readColabRuntime(), findColabHelperTabs()]);
+  if (!stored && !helperTabs.length) return { stopped: true, alreadyStopped: true };
+
+  const ordered = orderHelperTabs(helperTabs, stored);
+  let lastError: unknown = null;
+  for (const tab of ordered) {
+    if (tab.id === undefined) continue;
+    const response = await queryColabTab(tab.id);
+    const sessionId = String(response?.sessionId || "");
+    const event = response?.event;
+    if (event?.type !== "control" || event.session_id !== sessionId || !isValidColabSessionId(sessionId)) continue;
+    try {
+      const result = decodeColabControlValue(await callColabControl({
+        baseUrl: event.base_url,
+        token: event.token,
+        apiName: "shutdown",
+        data: []
+      }, {
+        connectAttempts: 2,
+        connectTimeoutMs: 5_000,
+        resultAttempts: 2,
+        resultTimeoutMs: 8_000
+      })) as any;
+      if (result?.ok !== true || result?.accepted !== true) throw new Error("Colab 未确认结束请求。");
+      await wait(COLAB_SHUTDOWN_GRACE_MS);
+      const tabIds = helperTabs.flatMap((item) => item.id === undefined ? [] : [item.id]);
+      if (tabIds.length) await chrome.tabs.remove(tabIds).catch(() => undefined);
+      await updateColabRuntime(() => null);
+      colabSessionEvents.delete(sessionId);
+      return { stopped: true };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw new Error(`无法安全结束 Colab：${lastError instanceof Error ? lastError.message : "控制通道尚未就绪"}`);
 }
 
 async function queryColabTab(tabId: number): Promise<any | null> {
@@ -233,7 +277,7 @@ async function findReusableColabRuntime(): Promise<unknown> {
   return null;
 }
 
-async function getColabRuntimeStatus(): Promise<{ state: string; label: string; tabId?: number; error?: string }> {
+async function getColabRuntimeStatus(): Promise<{ state: string; label: string; tabId?: number; error?: string; canStop?: boolean }> {
   const stored = await readColabRuntime();
   if (!stored) return { state: "stopped", label: runtimeStateLabel("stopped") };
   try {
@@ -242,7 +286,7 @@ async function getColabRuntimeStatus(): Promise<{ state: string; label: string; 
     if (response?.event?.type === "control" && response.event.session_id === stored.sessionId) {
       const ready = { ...stored, state: "ready" as const, lastSeenAt: Date.now(), error: undefined };
       await writeColabRuntime(ready);
-      return { state: ready.state, label: runtimeStateLabel(ready.state), tabId: ready.tabId };
+      return { state: ready.state, label: runtimeStateLabel(ready.state), tabId: ready.tabId, canStop: supportsColabShutdown(response.event) };
     }
     const starting = { ...stored, state: "starting" as const, lastSeenAt: Date.now() };
     if (stored.state === "starting" && response?.state !== "failed" && !isColabStartupExpired(starting)) {
@@ -275,7 +319,10 @@ async function isHealthyControlEvent(event: any, sessionId: string): Promise<boo
       resultAttempts: 2,
       resultTimeoutMs: 5_000
     })) as any;
-    return health?.ok === true && health?.protocol === 1 && health?.sessionId === sessionId;
+    return health?.ok === true
+      && health?.protocol === 1
+      && health?.sessionId === sessionId
+      && supportsColabShutdown(health);
   } catch {
     return false;
   }
@@ -293,6 +340,10 @@ function findPreferredHelperTab(tabs: chrome.tabs.Tab[], stored: ColabRuntimeSna
 function orderHelperTabs(tabs: chrome.tabs.Tab[], stored: ColabRuntimeSnapshot | null): chrome.tabs.Tab[] {
   const preferred = findPreferredHelperTab(tabs, stored);
   return preferred ? [preferred, ...tabs.filter((tab) => tab.id !== preferred.id)] : tabs;
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function relayColabEvent(payload: any, sender: chrome.runtime.MessageSender): Promise<{ relayed: true }> {

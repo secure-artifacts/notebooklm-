@@ -66,6 +66,7 @@ _batch_start_cursor = 0
 _cancelled = threading.Event()
 _upload_sessions = {}
 _tunnel_process = None
+_shutdown_requested = False
 
 
 def _clean(value, limit=500):
@@ -284,6 +285,7 @@ def health(token):
         "protocol": PROTOCOL,
         "sessionId": SESSION_ID,
         "busy": _batch_running,
+        "capabilities": ["shutdown"],
     }, separators=(",", ":"))
 
 
@@ -319,6 +321,28 @@ def cancel_batch(token):
     _authorized(token)
     _cancelled.set()
     return json.dumps({"ok": True}, separators=(",", ":"))
+
+
+def _unassign_runtime():
+    try:
+        from google.colab import runtime
+        runtime.unassign()
+    except Exception as error:
+        print(f"NLM shutdown failed: {_clean(error)}", flush=True)
+
+
+def shutdown(token):
+    global _shutdown_requested
+    _authorized(token)
+    with _lock:
+        if _shutdown_requested:
+            return json.dumps({"ok": True, "accepted": True, "duplicate": True}, separators=(",", ":"))
+        _shutdown_requested = True
+        _cancelled.set()
+    timer = threading.Timer(3.0, _unassign_runtime)
+    timer.daemon = True
+    timer.start()
+    return json.dumps({"ok": True, "accepted": True}, separators=(",", ":"))
 
 
 def _start_localtunnel(local_url):
@@ -411,11 +435,13 @@ with gr.Blocks(title="NotebookLM Facebook bridge") as app:
     upload_button = gr.Button(visible=False)
     poll_button = gr.Button(visible=False)
     cancel_button = gr.Button(visible=False)
+    shutdown_button = gr.Button(visible=False)
     start_button.click(start_batch, [tasks_input, token_input], result_output, api_name="start_batch")
     health_button.click(health, [token_input], result_output, api_name="health")
     upload_button.click(provide_upload, [upload_input, token_input], result_output, api_name="provide_upload")
     poll_button.click(poll_events, [cursor_input, token_input], result_output, api_name="poll_events")
     cancel_button.click(cancel_batch, [token_input], result_output, api_name="cancel_batch")
+    shutdown_button.click(shutdown, [token_input], result_output, api_name="shutdown")
 
 _, local_url, _ = app.queue(default_concurrency_limit=8, max_size=64).launch(
     share=False,
@@ -437,6 +463,7 @@ control_event = {
     "session_id": SESSION_ID,
     "base_url": share_url,
     "token": TOKEN,
+    "capabilities": ["shutdown"],
 }
 print("NLM_BRIDGE:" + json.dumps(control_event, ensure_ascii=False, separators=(",", ":")), flush=True)
 try:

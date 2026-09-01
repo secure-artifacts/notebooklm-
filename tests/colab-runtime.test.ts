@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   COLAB_RUNTIME_STALE_MS,
   COLAB_START_TIMEOUT_MS,
@@ -63,4 +64,13 @@ test("Colab bootstrap is split into bounded lines and ends with an integrity mar
   assert.equal((bootstrap.code.match(/"A+"/gu) || []).map((value) => value.slice(1, -1)).join(""), encodedPayload);
   assert.match(bootstrap.code, /hashlib\.sha256/);
   assert.match(bootstrap.code, /gzip\.decompress/);
+});
+
+test("Colab bridge exposes a token-protected delayed runtime shutdown", () => {
+  const source = readFileSync(new URL("../colab/facebook_notebooklm_bridge.py", import.meta.url), "utf8");
+  assert.match(source, /def shutdown\(token\):/u);
+  assert.match(source, /def shutdown\(token\):[\s\S]*?_authorized\(token\)/u);
+  assert.match(source, /threading\.Timer\(3\.0, _unassign_runtime\)/u);
+  assert.match(source, /runtime\.unassign\(\)/u);
+  assert.match(source, /api_name="shutdown"/u);
 });

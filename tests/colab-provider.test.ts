@@ -6,12 +6,15 @@ import {
   classifyColabFailure,
   colabBridgePrefix,
   decodeColabControlValue,
+  isFacebookTableRowPopulated,
   parseColabBridgeOutput,
   parseColabControlEvents,
   parseGradioSseData,
+  supportsColabShutdown,
   parseFacebookTasks,
   parseFacebookTableRows,
-  parseFacebookClipboardRows
+  parseFacebookClipboardRows,
+  shouldAppendFacebookEditorRow
 } from "../src/lib/colabProvider";
 
 test("parseFacebookTasks accepts named and unnamed public links", () => {
@@ -34,6 +37,12 @@ test("parseFacebookTasks accepts named and unnamed public links", () => {
     }
   ]);
   assert.deepEqual(result.errors, []);
+});
+
+test("Colab shutdown requires an explicitly advertised capability", () => {
+  assert.equal(supportsColabShutdown({ capabilities: ["shutdown"] }), true);
+  assert.equal(supportsColabShutdown({ capabilities: [] }), false);
+  assert.equal(supportsColabShutdown({}), false);
 });
 
 test("parseFacebookTasks reports malformed lines and enforces the batch limit", () => {
@@ -70,6 +79,15 @@ test("Facebook clipboard parser accepts spreadsheet columns and legacy lines", (
     { postId: "post-1", url: "https://www.facebook.com/watch/?v=1", twoColumns: true },
     { postId: "post-2", url: "https://fb.watch/example/", twoColumns: true }
   ]);
+});
+
+test("Facebook editor keeps one automatic trailing row up to the task limit", () => {
+  assert.equal(isFacebookTableRowPopulated({ postId: "", url: "" }), false);
+  assert.equal(isFacebookTableRowPopulated({ postId: "post-1", url: "" }), true);
+  assert.equal(shouldAppendFacebookEditorRow([], 1000), true);
+  assert.equal(shouldAppendFacebookEditorRow([{ postId: "", url: "" }], 1000), false);
+  assert.equal(shouldAppendFacebookEditorRow([{ postId: "post-1", url: "https://facebook.com/1" }], 1000), true);
+  assert.equal(shouldAppendFacebookEditorRow([{ postId: "post-1", url: "https://facebook.com/1" }], 1), false);
 });
 
 test("parseColabBridgeOutput ignores partial and invalid events and deduplicates event ids", () => {

@@ -68,3 +68,35 @@ test("status_counts formatting remains directly copyable", () => {
   utils.mergeStatusCounts(counts, { inserted: 1, updated: 3 });
   assert.equal(utils.formatStatusCounts(counts), 'status_counts\n{\n  "inserted": 3,\n  "updated": 3\n}');
 });
+
+test("sheet registration batches honor both record count and UTF-8 payload size", () => {
+  const records = Array.from({ length: 5 }, (_, index) => ({
+    post_id: `post-${index}`,
+    audio_content: "缅甸语".repeat(30),
+    audio_content_zh: "中文".repeat(30)
+  }));
+  const batches = utils.chunkSheetRegistrationRecords(records, "https://docs.google.com/spreadsheets/d/a/edit?gid=1", {
+    maxRecords: 200,
+    maxPayloadBytes: 700
+  });
+
+  assert.equal(batches.flat().length, records.length);
+  assert.ok(batches.length > 1);
+  assert.ok(batches.every((batch) => batch.length === 1 ||
+    utils.sheetRegistrationPayloadBytes("https://docs.google.com/spreadsheets/d/a/edit?gid=1", batch) <= 700));
+});
+
+test("sheet registration recognizes structured and textual 413 failures", () => {
+  assert.equal(utils.isSheetRequestTooLarge({ http_status: 413 }), true);
+  assert.equal(utils.isSheetRequestTooLarge({ error: { code: "REQUEST_TOO_LARGE" } }), true);
+  assert.equal(utils.isSheetRequestTooLarge(new Error("HTTP 413: request entity too large")), true);
+  assert.equal(utils.isSheetRequestTooLarge({ http_status: 500 }), false);
+});
+
+test("sheet registration failure logs summarize long post id lists", () => {
+  const records = Array.from({ length: 15 }, (_, index) => ({ post_id: `post-${index}` })) as any;
+  assert.equal(
+    utils.summarizeSheetPostIds(records, 3),
+    "post-0、post-1、post-2；另有 12 条"
+  );
+});

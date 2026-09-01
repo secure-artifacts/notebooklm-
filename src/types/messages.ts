@@ -7,6 +7,7 @@ export type PanelLayout = {
 
 export type PanelSettings = {
   aiTranslationEnabled: boolean;
+  aiTranslationBatchSize: number;
   autoDeleteImported: boolean;
   autoRegisterImported: boolean;
   driveBatchSize: number;
@@ -35,7 +36,7 @@ export type ExtensionResources = {
   extensionOrigin: string;
 };
 
-export type ColabApiName = "health" | "start_batch" | "provide_upload" | "poll_events" | "cancel_batch";
+export type ColabApiName = "health" | "start_batch" | "provide_upload" | "poll_events" | "cancel_batch" | "shutdown";
 
 export type ColabApiRequest = {
   baseUrl: string;

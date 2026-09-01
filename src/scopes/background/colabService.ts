@@ -6,7 +6,8 @@ const allowedApis = new Set<ColabApiName>([
   "start_batch",
   "provide_upload",
   "poll_events",
-  "cancel_batch"
+  "cancel_batch",
+  "shutdown"
 ]);
 const CONTROL_TIMEOUT_MS = 45_000;
 const MAX_REQUEST_CHARS = 512_000;

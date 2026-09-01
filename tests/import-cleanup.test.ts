@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { completedSourceIdsForCleanup } from "../src/lib/importCleanup";
+import { completedSourceIdsForCleanup, partitionInterruptedSourceIds } from "../src/lib/importCleanup";
 import type { TranscriptRecord } from "../src/types/domain";
 
 const records: TranscriptRecord[] = [
@@ -13,4 +13,17 @@ const records: TranscriptRecord[] = [
 test("cleanup keeps transcription and translation failures for retry", () => {
   assert.deepEqual(completedSourceIdsForCleanup(records, false), ["ready", "untranslated"]);
   assert.deepEqual(completedSourceIdsForCleanup(records, true), ["ready"]);
+});
+
+test("translation interruption preserves recorded sources and only cleans orphaned uploads", () => {
+  assert.deepEqual(
+    partitionInterruptedSourceIds(
+      ["ready", "untranslated", "failed", "orphaned", "ready"],
+      records
+    ),
+    {
+      preserved: ["ready", "untranslated", "failed"],
+      orphaned: ["orphaned"]
+    }
+  );
 });

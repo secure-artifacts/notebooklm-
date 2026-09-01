@@ -4,6 +4,9 @@ import type { TranscriptRecord } from "@/types/domain";
 export type FailureLog = { title: string; message: string };
 export type StatusCounts = Record<string, number>;
 
+export const SHEET_REGISTRATION_MAX_RECORDS = 200;
+export const SHEET_REGISTRATION_SAFE_PAYLOAD_BYTES = 1_500_000;
+
 export function parseStatusCount(value: unknown, fallback = 0): number {
   const count = Number(value);
   return Number.isFinite(count) && count >= 0 ? Math.floor(count) : fallback;
@@ -41,6 +44,58 @@ export function toSheetRecords(
     audio_content: record.transcript,
     audio_content_zh: record.translation || ""
   }));
+}
+
+export function sheetRegistrationPayloadBytes(databaseUrl: string, records: SheetRecord[]): number {
+  return new TextEncoder().encode(JSON.stringify({
+    database_url: String(databaseUrl || ""),
+    records: Array.isArray(records) ? records : []
+  })).byteLength;
+}
+
+export function chunkSheetRegistrationRecords(
+  records: SheetRecord[],
+  databaseUrl: string,
+  options: { maxRecords?: number; maxPayloadBytes?: number } = {}
+): SheetRecord[][] {
+  const maxRecords = Math.max(1, Math.floor(options.maxRecords || SHEET_REGISTRATION_MAX_RECORDS));
+  const maxPayloadBytes = Math.max(1024, Math.floor(options.maxPayloadBytes || SHEET_REGISTRATION_SAFE_PAYLOAD_BYTES));
+  const batches: SheetRecord[][] = [];
+  let current: SheetRecord[] = [];
+
+  for (const record of Array.isArray(records) ? records : []) {
+    const candidate = [...current, record];
+    if (current.length && (candidate.length > maxRecords ||
+      sheetRegistrationPayloadBytes(databaseUrl, candidate) > maxPayloadBytes)) {
+      batches.push(current);
+      current = [record];
+    } else {
+      current = candidate;
+    }
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+export function isSheetRequestTooLarge(value: unknown): boolean {
+  const candidate = value as {
+    http_status?: unknown;
+    httpStatus?: unknown;
+    error?: { code?: unknown; message?: unknown };
+    code?: unknown;
+    message?: unknown;
+  } | null;
+  const status = Number(candidate?.http_status ?? candidate?.httpStatus);
+  const code = String(candidate?.error?.code ?? candidate?.code ?? "").toUpperCase();
+  const message = String(candidate?.error?.message ?? candidate?.message ?? value ?? "");
+  return status === 413 || code === "REQUEST_TOO_LARGE" || /HTTP\s*413|REQUEST_TOO_LARGE|请求体超过\s*2\s*MB|request entity too large/i.test(message);
+}
+
+export function summarizeSheetPostIds(records: SheetRecord[], limit = 12): string {
+  const postIds = (Array.isArray(records) ? records : []).map((record) => String(record.post_id || "未命名"));
+  const visible = postIds.slice(0, Math.max(1, Math.floor(limit)));
+  const remaining = postIds.length - visible.length;
+  return `${visible.join("、")}${remaining > 0 ? `；另有 ${remaining} 条` : ""}`;
 }
 
 type ServiceOutcome = {
@@ -82,7 +137,7 @@ export function analyzeBatchResponse(
       message: [
         `HTTP ${status} · request_id: ${requestId}`,
         `${apiError.code || "UNKNOWN"}：${apiError.message || "服务未返回具体原因"}`,
-        `未登记 post_id：${records.map((record) => record.post_id).join("、")}`
+        `未登记 post_id：${summarizeSheetPostIds(records)}`
       ].join("\n")
     });
     return { success: 0, failed: records.length, statusCounts, failureLogs, requestFailed: true };
@@ -102,10 +157,10 @@ export function analyzeBatchResponse(
     addStatusCount(statusCounts, "unreported_result", unaccounted);
     const reportedIndexes = new Set(outcomes.map((outcome) => Number(outcome?.index))
       .filter((index) => Number.isInteger(index) && index >= 0 && index < records.length));
-    const missingPostIds = records.filter((_record, index) => !reportedIndexes.has(index)).map((record) => record.post_id);
+    const missingRecords = records.filter((_record, index) => !reportedIndexes.has(index));
     failureLogs.push({
       title: `批次 ${batchLabel} 返回不完整`,
-      message: `服务未返回 ${unaccounted} 条记录的结果。未确认 post_id：${missingPostIds.join("、") || "无法确定"}`
+      message: `服务未返回 ${unaccounted} 条记录的结果。未确认 post_id：${summarizeSheetPostIds(missingRecords) || "无法确定"}`
     });
   }
 

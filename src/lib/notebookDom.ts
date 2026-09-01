@@ -92,12 +92,15 @@ export function sourcesAreSelected(records: TranscriptRecord[], doc: Document): 
 
 export function findChatInput(doc: Document, panelRoot: Element | null): HTMLTextAreaElement | null {
   const chatPanel = doc.querySelector(".chat-panel");
-  const scopedCandidates = chatPanel ? Array.from(chatPanel.querySelectorAll<HTMLTextAreaElement>("textarea")) : [];
+  const outsidePluginPanel = (textarea: HTMLTextAreaElement) => !(panelRoot && panelRoot.contains(textarea));
+  const scopedCandidates = chatPanel
+    ? Array.from(chatPanel.querySelectorAll<HTMLTextAreaElement>("textarea")).filter(outsidePluginPanel)
+    : [];
   const labelledCandidates = CHAT_INPUT_LABELS.flatMap((label) =>
-    Array.from(doc.querySelectorAll<HTMLTextAreaElement>(`textarea[aria-label="${label}"]`)));
+    Array.from(doc.querySelectorAll<HTMLTextAreaElement>(`textarea[aria-label="${label}"]`)).filter(outsidePluginPanel));
   const structuralCandidates = Array.from(doc.querySelectorAll<HTMLTextAreaElement>("textarea"))
     .filter((textarea) => {
-      if (panelRoot && panelRoot.contains(textarea)) return false;
+      if (!outsidePluginPanel(textarea)) return false;
       const form = textarea.closest("form");
       return Boolean(form && form.querySelector('button[type="submit"]'));
     });
@@ -107,6 +110,27 @@ export function findChatInput(doc: Document, panelRoot: Element | null): HTMLTex
 
 export function findChatPanel(input: HTMLTextAreaElement | null, doc: Document): Element | null {
   return doc.querySelector(".chat-panel") || input?.closest(".chat-panel") || null;
+}
+
+export function isNotebookAiGenerating(
+  doc: Document,
+  chatPanel: Element | null,
+  panelRoot: Element | null
+): boolean {
+  const scopes: ParentNode[] = chatPanel ? [chatPanel, doc] : [doc];
+  for (const scope of scopes) {
+    const controls = Array.from(scope.querySelectorAll<HTMLButtonElement>("button"));
+    const stopButton = controls.find((button) => {
+      if (panelRoot && panelRoot.contains(button)) return false;
+      if (!isUsableControl(button, doc)) return false;
+      const label = String(button.getAttribute("aria-label") || "").trim().toLowerCase();
+      const icon = String(button.textContent || "").trim().toLowerCase();
+      return button.classList?.contains("stop-button") || icon === "stop" ||
+        /stop\s*(generating|generation|response)|停止生成|停止產生|生成を停止|생성 중지/.test(label);
+    });
+    if (stopButton) return true;
+  }
+  return false;
 }
 
 export function findChatSubmit(
@@ -142,5 +166,11 @@ export function getAiResponseTexts(responseRoot: ParentNode): string[] {
       clone.querySelectorAll(".citation-marker").forEach((marker) => marker.remove());
       return String(clone.textContent || "").trim();
     })
+    .filter(Boolean);
+}
+
+export function getUserMessageTexts(responseRoot: ParentNode): string[] {
+  return Array.from(responseRoot.querySelectorAll(".from-user-message-inner-content"))
+    .map((message) => String((message.querySelector(".message-text-content") || message).textContent || "").trim())
     .filter(Boolean);
 }

@@ -1,7 +1,11 @@
 import {
+  DEFAULT_AI_TRANSLATION_BATCH_SIZE,
+  MAX_AI_TRANSLATION_BATCH_SIZE,
+  MIN_AI_TRANSLATION_BATCH_SIZE,
   buildTranslationPrompt,
   extractJsonArrayCandidates,
   mergeTranslationPayload,
+  normalizeAiTranslationBatchSize,
   sourceNamesMatch,
   stripSourceSuffix
 } from "@/lib/aiTranslation";
@@ -13,8 +17,13 @@ import {
   normalizeBatchSize,
   parseDriveUrls
 } from "@/lib/driveImport";
-import { completedSourceIdsForCleanup } from "@/lib/importCleanup";
-import { parseFacebookClipboardRows, parseFacebookTableRows } from "@/lib/colabProvider";
+import { completedSourceIdsForCleanup, partitionInterruptedSourceIds } from "@/lib/importCleanup";
+import {
+  isFacebookTableRowPopulated,
+  parseFacebookClipboardRows,
+  parseFacebookTableRows,
+  shouldAppendFacebookEditorRow
+} from "@/lib/colabProvider";
 import {
   FACEBOOK_BATCH_SIZE,
   FACEBOOK_MAX_TASKS,
@@ -29,8 +38,11 @@ import {
 import {
   addStatusCount,
   analyzeBatchResponse,
+  chunkSheetRegistrationRecords,
   formatStatusCounts,
+  isSheetRequestTooLarge,
   mergeStatusCounts,
+  summarizeSheetPostIds,
   toSheetRecords,
   validDatabaseUrl,
   validDeploymentUrl
@@ -41,6 +53,8 @@ import {
   findChatPanel,
   findChatSubmit,
   getAiResponseTexts,
+  getUserMessageTexts,
+  isNotebookAiGenerating,
   restoreSourceSelection,
   selectSourcesForRecordsWhenReady,
   sourcesAreSelected
@@ -69,13 +83,18 @@ import type { NotebookAction } from "./apiClient";
   const DRIVE_PIPELINE_CONCURRENCY = 3;
   const DRIVE_DOWNLOAD_MAX_ATTEMPTS = 3;
   const DRIVE_RETRY_BASE_DELAY_MS = 1000;
-  const SHEET_REGISTRATION_BATCH_SIZE = 200;
-  const AI_TRANSLATION_BATCH_SIZE = 10;
-  const AI_TRANSLATION_TIMEOUT_MS = 5 * 60 * 1000;
+  const AI_TRANSLATION_TIMEOUT_MS = 15 * 60 * 1000;
   const AI_TRANSLATION_RETRY_LIMIT = 1;
   const AI_TRANSLATION_SPLIT_SIZE = 5;
   const AI_TRANSLATION_POLL_MS = 500;
   const AI_TRANSLATION_SETTLE_MS = 1400;
+
+  class AiTranslationPageStateError extends Error {
+    constructor(message: string) {
+      super(message);
+      this.name = "AiTranslationPageStateError";
+    }
+  }
   const MAX_LOGS = 240;
   const DRIVE_BRIDGE_TOKEN = typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
@@ -85,6 +104,7 @@ import type { NotebookAction } from "./apiClient";
     records: TranscriptRecord[];
     isBusy: boolean;
     translateEnabled: boolean;
+    translationBatchSize: number;
     autoDeleteImported: boolean;
     autoRegisterImported: boolean;
     driveBatchSize: number;
@@ -126,6 +146,7 @@ import type { NotebookAction } from "./apiClient";
     records: [],
     isBusy: false,
     translateEnabled: false,
+    translationBatchSize: DEFAULT_AI_TRANSLATION_BATCH_SIZE,
     autoDeleteImported: true,
     autoRegisterImported: false,
     driveBatchSize: DEFAULT_DRIVE_BATCH_SIZE,
@@ -205,6 +226,7 @@ export function bootNotebookApp(): void {
     extensionResources = resources;
     const panelSettings = saved.panel;
     state.translateEnabled = panelSettings.aiTranslationEnabled === true;
+    state.translationBatchSize = normalizeAiTranslationBatchSize(panelSettings.aiTranslationBatchSize);
     state.autoDeleteImported = panelSettings.autoDeleteImported !== false;
     state.autoRegisterImported = panelSettings.autoRegisterImported === true || panelSettings.facebookAutoRegister === true;
     state.driveBatchSize = normalizeDriveBatchSize(panelSettings.driveBatchSize);
@@ -287,6 +309,7 @@ export function bootNotebookApp(): void {
         </div>
         <div class="nlm-header-actions">
           <label class="nlm-translate-toggle"><input type="checkbox" data-role="translate-toggle"><span>AI 翻译</span></label>
+          <label class="nlm-batch-size nlm-ai-batch-size" title="每次提交给 NotebookLM 翻译的来源数量"><span>每批</span><input type="number" data-role="translation-batch-size" min="${MIN_AI_TRANSLATION_BATCH_SIZE}" max="${MAX_AI_TRANSLATION_BATCH_SIZE}" step="1" inputmode="numeric"><span>个</span></label>
           <button type="button" class="nlm-minimize" data-action="minimize" aria-label="最小化" title="最小化">−</button>
         </div>
       </header>
@@ -311,19 +334,17 @@ export function bootNotebookApp(): void {
               </div>
             </section>
             <section class="nlm-import-pane" data-role="facebook-pane" role="tabpanel">
-              <div class="nlm-facebook-table-toolbar">
-                <label><input type="checkbox" data-role="facebook-select-all"><span>全选</span></label>
-                <span data-role="facebook-row-count">0 条</span>
-                <button type="button" data-action="facebook-add-row">＋ 添加行</button>
-                <button type="button" data-action="facebook-delete-selected">删除选中</button>
-                <button type="button" class="nlm-facebook-start" data-action="import-facebook">开始导入</button>
-              </div>
-              <div class="nlm-facebook-grid" role="grid" aria-label="Facebook 导入任务表">
+              <div class="nlm-facebook-grid" role="grid" aria-label="Facebook 导入任务表" title="可像表格一样拖选、复制并粘贴两列数据">
                 <div class="nlm-facebook-grid-head" role="row"><span></span><b>贴文 ID</b><b>Facebook 链接</b><b>状态</b></div>
                 <div class="nlm-facebook-grid-body" data-role="facebook-grid-body"></div>
               </div>
-              <div class="nlm-facebook-table-footer">
-                <p class="nlm-facebook-paste-tip">像表格一样拖选、复制、粘贴两列；最多 1000 条，每批 20 条。</p>
+              <div class="nlm-facebook-table-footer nlm-facebook-table-toolbar">
+                <label><input type="checkbox" data-role="facebook-select-all"><span>全选</span></label>
+                <span data-role="facebook-row-count">0 条</span>
+                <button type="button" data-action="facebook-delete-all" title="立即清空 Facebook 任务表">清空表格</button>
+                <button type="button" data-action="facebook-delete-success" title="删除状态为成功的任务行">删除成功</button>
+                <button type="button" data-action="facebook-retry-selected" title="重新处理勾选的任务">重试选中</button>
+                <button type="button" class="nlm-facebook-start" data-action="import-facebook">开始导入</button>
                 <button type="button" class="nlm-facebook-cancel" data-action="cancel-facebook" hidden>暂停</button>
               </div>
             </section>
@@ -344,8 +365,8 @@ export function bootNotebookApp(): void {
           </div>
           <div class="nlm-extract-actions">
             <button type="button" data-action="extract">提取现有来源</button>
-            <button type="button" data-action="clear-records">清除提取记录</button>
-            <button type="button" data-action="delete-all-sources">清空左侧来源</button>
+            <button type="button" data-action="clear-records">清空提取记录</button>
+            <button type="button" data-action="delete-all-sources">删除已添加的来源</button>
             <span data-role="status">准备就绪</span>
           </div>
         </section>
@@ -389,6 +410,13 @@ export function bootNotebookApp(): void {
         setStage(state.translateEnabled ? "AI 翻译已开启" : "AI 翻译已关闭");
       }
     });
+    panelQuery<HTMLInputElement>("[data-role='translation-batch-size']").addEventListener("change", async (event) => {
+      const input = event.currentTarget as HTMLInputElement;
+      state.translationBatchSize = normalizeAiTranslationBatchSize(input.value);
+      input.value = String(state.translationBatchSize);
+      setStage(`AI 翻译每批处理 ${state.translationBatchSize} 个来源`);
+      await savePanelSettings();
+    });
     panelQuery<HTMLInputElement>("[data-role='auto-delete-toggle']").addEventListener("change", async (event) => {
       state.autoDeleteImported = (event.currentTarget as HTMLInputElement).checked;
       setStage(state.autoDeleteImported ? "自动移除已开启" : "自动移除已关闭");
@@ -417,7 +445,9 @@ export function bootNotebookApp(): void {
     facebookGrid.addEventListener("keydown", handleFacebookGridKeyDown);
     panelQuery<HTMLInputElement>("[data-role='facebook-select-all']").addEventListener("change", (event) => {
       const checked = (event.currentTarget as HTMLInputElement).checked;
-      state.facebookRows.forEach((row) => { row.selected = checked; });
+      state.facebookRows.forEach((row) => {
+        row.selected = checked && isPopulatedFacebookRow(row);
+      });
       renderFacebookTable();
     });
     state.root.addEventListener("click", (event) => {
@@ -438,13 +468,16 @@ export function bootNotebookApp(): void {
         void savePanelSettings();
         return;
       }
-      if (button.dataset.action === "facebook-add-row") {
-        if (state.facebookRows.length < FACEBOOK_MAX_TASKS) state.facebookRows.push(createFacebookInputRow());
-        renderFacebookTable();
+      if (button.dataset.action === "facebook-delete-all") {
+        void deleteAllFacebookRows();
         return;
       }
-      if (button.dataset.action === "facebook-delete-selected") {
-        void deleteSelectedFacebookRows();
+      if (button.dataset.action === "facebook-delete-success") {
+        void deleteSuccessfulFacebookRows();
+        return;
+      }
+      if (button.dataset.action === "facebook-retry-selected") {
+        void retrySelectedFacebookRows();
         return;
       }
       if (button.dataset.action === "show-results") return switchBottomView("results");
@@ -481,10 +514,17 @@ export function bootNotebookApp(): void {
     return { key: facebookRowSequence, postId, url, status, statusKind: "idle", selected: false };
   }
 
-  function ensureFacebookEditorRows(minimum = 5) {
+  function ensureFacebookEditorRows(minimum = 1) {
     while (state.facebookRows.length < minimum && state.facebookRows.length < FACEBOOK_MAX_TASKS) {
       state.facebookRows.push(createFacebookInputRow());
     }
+    if (shouldAppendFacebookEditorRow(state.facebookRows, FACEBOOK_MAX_TASKS)) {
+      state.facebookRows.push(createFacebookInputRow());
+    }
+  }
+
+  function isPopulatedFacebookRow(row: FacebookInputRow): boolean {
+    return isFacebookTableRowPopulated(row);
   }
 
   function handleFacebookGridInput(event: Event) {
@@ -634,16 +674,17 @@ export function bootNotebookApp(): void {
     }
   }
 
-  async function deleteSelectedFacebookRows() {
-    const selectedRows = state.facebookRows.filter((row) => row.selected);
-    if (!selectedRows.length) return setStage("请先勾选要删除的 Facebook 行");
+  async function removeFacebookRows(rows: FacebookInputRow[], label: string) {
+    if (state.isBusy) return setStage("任务运行期间不能修改 Facebook 队列");
+    const targetRows = rows.filter(isPopulatedFacebookRow);
+    if (!targetRows.length) return false;
     if (facebookJob?.activeSourceIds.length) {
       setStage("队列仍有中断批次来源，请先继续队列完成清理后再删除任务");
-      return;
+      return false;
     }
     if (facebookJob) {
-      const selectedTaskIds = new Set(selectedRows.map((row) => row.persistedTaskId).filter(Boolean) as string[]);
-      const selectedKeys = new Set(selectedRows.map((row) => `${stripSourceSuffix(row.postId)}\n${row.url.trim()}`));
+      const selectedTaskIds = new Set(targetRows.map((row) => row.persistedTaskId).filter(Boolean) as string[]);
+      const selectedKeys = new Set(targetRows.map((row) => `${stripSourceSuffix(row.postId)}\n${row.url.trim()}`));
       facebookJob.tasks.forEach((task) => {
         if (selectedKeys.has(`${stripSourceSuffix(task.postId)}\n${task.url.trim()}`)) selectedTaskIds.add(task.taskId);
       });
@@ -655,17 +696,47 @@ export function bootNotebookApp(): void {
         } catch (error) {
           setStage("删除失败：无法更新 Facebook 队列缓存，请重试");
           addLog(error instanceof Error ? error.message : String(error), "队列缓存");
-          return;
+          return false;
         }
       }
     }
-    state.facebookRows = state.facebookRows.filter((row) => !row.selected);
+    const targetKeys = new Set(targetRows.map((row) => row.key));
+    state.facebookRows = state.facebookRows.filter((row) => !targetKeys.has(row.key));
     ensureFacebookEditorRows();
     facebookCellAnchor = null;
     facebookCellFocus = null;
     renderFacebookTable();
-    const populated = selectedRows.filter((row) => row.postId.trim() || row.url.trim()).length;
-    setStage(`已删除 ${populated || selectedRows.length} 行，并同步更新队列缓存`);
+    setStage(`${label} ${targetRows.length} 行，并同步更新队列缓存`);
+    return true;
+  }
+
+  async function deleteAllFacebookRows() {
+    const rows = state.facebookRows.filter(isPopulatedFacebookRow);
+    if (!rows.length) return setStage("Facebook 任务表已经为空");
+    await removeFacebookRows(rows, "已清空表格，共移除");
+  }
+
+  async function deleteSuccessfulFacebookRows() {
+    const rows = state.facebookRows.filter((row) => isPopulatedFacebookRow(row) && row.statusKind === "success");
+    if (!rows.length) return setStage("当前没有可删除的成功任务");
+    await removeFacebookRows(rows, "已删除成功任务");
+  }
+
+  async function retrySelectedFacebookRows() {
+    if (state.isBusy) return setStage("当前任务尚未结束，请稍后再重试");
+    if (facebookJob?.activeSourceIds.length) {
+      return setStage("队列仍有中断批次来源，请先继续队列完成清理后再重试");
+    }
+    const rows = state.facebookRows.filter((row) => row.selected && isPopulatedFacebookRow(row));
+    if (!rows.length) return setStage("请先勾选要重试的 Facebook 任务");
+    rows.forEach((row) => {
+      row.status = "等待重试";
+      row.statusKind = "idle";
+      row.selected = false;
+    });
+    renderFacebookTable();
+    addLog(`准备重新处理选中的 ${rows.length} 条 Facebook 任务。`, "重新处理");
+    await importFacebookMedia(rows);
   }
 
   function renderFacebookTable() {
@@ -685,12 +756,17 @@ export function bootNotebookApp(): void {
         <span class="nlm-facebook-row-status is-${kind}" title="${escapeHtml(status)}">${escapeHtml(status)}</span>
       </div>`;
     }).join("");
-    const populated = state.facebookRows.filter((row) => row.postId.trim() || row.url.trim()).length;
+    const populatedRows = state.facebookRows.filter(isPopulatedFacebookRow);
+    const populated = populatedRows.length;
     panelQuery("[data-role='facebook-row-count']").textContent = `${populated} 条`;
     const selectAll = panelQuery<HTMLInputElement>("[data-role='facebook-select-all']");
-    selectAll.checked = Boolean(state.facebookRows.length && state.facebookRows.every((row) => row.selected));
-    selectAll.indeterminate = state.facebookRows.some((row) => row.selected) && !selectAll.checked;
-    selectAll.disabled = state.isBusy;
+    const selectedPopulated = populatedRows.filter((row) => row.selected);
+    selectAll.checked = Boolean(populatedRows.length && selectedPopulated.length === populatedRows.length);
+    selectAll.indeterminate = selectedPopulated.length > 0 && !selectAll.checked;
+    selectAll.disabled = state.isBusy || !populatedRows.length;
+    panelQuery<HTMLButtonElement>("[data-action='facebook-delete-all']").disabled = state.isBusy || !populatedRows.length;
+    panelQuery<HTMLButtonElement>("[data-action='facebook-delete-success']").disabled = state.isBusy || !populatedRows.some((row) => row.statusKind === "success");
+    panelQuery<HTMLButtonElement>("[data-action='facebook-retry-selected']").disabled = state.isBusy || !selectedPopulated.length;
     updateFacebookCellSelectionDom();
   }
 
@@ -721,8 +797,8 @@ export function bootNotebookApp(): void {
     status.title = row.status;
   }
 
-  async function importFacebookMedia() {
-    const parsed = parseFacebookTableRows(state.facebookRows, FACEBOOK_MAX_TASKS);
+  async function importFacebookMedia(inputRows: FacebookInputRow[] = state.facebookRows) {
+    const parsed = parseFacebookTableRows(inputRows, FACEBOOK_MAX_TASKS);
     renderFacebookTable();
     if (!parsed.tasks.length) {
       setStage(parsed.errors[0] || "请填写有效的 Facebook 公开视频任务");
@@ -798,9 +874,13 @@ export function bootNotebookApp(): void {
     else await extensionClient.saveFacebookJob(job);
     render();
 
+    let activeBatchRecords: TranscriptRecord[] = [];
+    let activeBatchTaskCount = 0;
     try {
       let queueBatchSequence = 0;
       while (job.nextIndex < job.tasks.length && !facebookPauseRequested) {
+        activeBatchRecords = [];
+        activeBatchTaskCount = 0;
         const summary = await getNotebookSourceSummary();
         const batch = nextFacebookBatch(job, summary.totalSources);
         if (!batch.length) {
@@ -843,6 +923,8 @@ export function bootNotebookApp(): void {
         facebookCoordinator = null;
         const added = mergeRecords(records);
         const batchRecords = resolveMergedRecords(records);
+        activeBatchRecords = batchRecords;
+        activeBatchTaskCount = batch.length;
         const failed = batchRecords.filter((record) => record.error || !record.transcript).length;
         batch.forEach((task) => {
           const record = batchRecords.find((item) => stripSourceSuffix(item.sourceName) === stripSourceSuffix(task.postId));
@@ -897,13 +979,29 @@ export function bootNotebookApp(): void {
       const message = error instanceof Error ? error.message : String(error);
       await facebookCoordinator?.cancel();
       if (facebookJob) {
-        if (facebookJob.autoDelete && facebookJob.activeSourceIds.length) {
+        const translationInterrupted = error instanceof AiTranslationPageStateError && activeBatchTaskCount > 0;
+        if (translationInterrupted) {
+          const partition = partitionInterruptedSourceIds(facebookJob.activeSourceIds, activeBatchRecords);
+          facebookJob.activeSourceIds = partition.orphaned;
+          if (facebookJob.autoDelete && facebookJob.activeSourceIds.length) {
+            await cleanupInterruptedFacebookSources(facebookJob);
+          }
+          facebookJob.nextIndex = Math.min(facebookJob.tasks.length, facebookJob.nextIndex + activeBatchTaskCount);
+          facebookJob.activeBatchStart = facebookJob.nextIndex;
+          facebookJob.records = getFacebookJobRecords(facebookJob);
+          addLog(
+            `AI 翻译暂停：已保留当前批次 ${partition.preserved.length} 个已导入来源，` +
+            `并将导入检查点推进到 ${facebookJob.nextIndex}/${facebookJob.tasks.length}，恢复时不会重复上传。` +
+            "等待当前回答结束后，可关闭再开启 AI 翻译开关补译这些记录。",
+            "来源保留"
+          );
+        } else if (facebookJob.autoDelete && facebookJob.activeSourceIds.length) {
           await cleanupInterruptedFacebookSources(facebookJob);
         }
         facebookJob.status = "paused";
         facebookJob.lastError = message;
         facebookJob.records = getFacebookJobRecords(facebookJob);
-        await saveFacebookCheckpoint();
+        await saveFacebookCheckpoint(activeBatchRecords);
       }
       setStage(`${message} 已保存进度，可处理问题后继续。`);
       addLog(`${message}；检查点停在 ${facebookJob?.nextIndex || 0}/${facebookJob?.tasks.length || 0}。`, "队列暂停");
@@ -980,6 +1078,7 @@ export function bootNotebookApp(): void {
       task.taskId
     ]));
     state.facebookRows.forEach((row) => {
+      delete row.persistedTaskId;
       row.persistedTaskId = tasksByKey.get(`${stripSourceSuffix(row.postId)}\n${row.url.trim()}`);
     });
   }
@@ -1060,25 +1159,43 @@ export function bootNotebookApp(): void {
       return;
     }
     const sheetRecords = toSheetRecords(available, sourceNameToPostId);
-    try {
-      const result = await callSheetUpsert(databaseUrl, sheetRecords);
-      const analysis = analyzeBatchResponse(result as any, sheetRecords, { batchStart: 0, batchLabel });
-      addLog(formatStatusCounts(analysis.statusCounts), "自动登记 status_counts");
-      analysis.failureLogs.forEach((entry) => addLog(entry.message, entry.title));
-      if (!analysis.failed) {
-        available.forEach((record) => {
-          record.registered = true;
-          record.registrationError = undefined;
+    const batches = chunkSheetRegistrationRecords(sheetRecords, databaseUrl);
+    const statusCounts = Object.create(null);
+    let totalSuccess = 0;
+    let totalFailed = 0;
+    let batchStart = 0;
+    for (let index = 0; index < batches.length; index += 1) {
+      const current = batches[index];
+      const currentLabel = `${batchLabel}.${index + 1}/${batches.length}`;
+      const attempts = await submitSheetBatchAdaptive(databaseUrl, current, batchStart, currentLabel);
+      attempts.forEach((attempt) => {
+        if (attempt.error) {
+          totalFailed += attempt.records.length;
+          addStatusCount(statusCounts, "request_failed", attempt.records.length);
+          addLog(formatSheetRequestError(attempt.error, attempt.records), "自动登记失败");
+          return;
+        }
+        const analysis = analyzeBatchResponse(attempt.result as any, attempt.records, {
+          batchStart: attempt.batchStart,
+          batchLabel: attempt.batchLabel
         });
-      } else {
-        available.forEach((record) => { record.registrationError = `批次自动登记存在 ${analysis.failed} 条失败，可稍后手动登记。`; });
-      }
-      addLog(`${batchLabel} 自动登记：成功 ${analysis.success}，失败 ${analysis.failed}。`, analysis.failed ? "自动登记失败" : "自动登记");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      available.forEach((record) => { record.registrationError = message; });
-      addLog(`${batchLabel} 自动登记请求失败：${message}。队列将继续，稍后可手动登记。`, "自动登记失败");
+        mergeStatusCounts(statusCounts, analysis.statusCounts);
+        totalSuccess += analysis.success;
+        totalFailed += analysis.failed;
+        analysis.failureLogs.forEach((entry) => addLog(entry.message, entry.title));
+      });
+      batchStart += current.length;
     }
+    addLog(formatStatusCounts(statusCounts), "自动登记 status_counts");
+    if (!totalFailed) {
+      available.forEach((record) => {
+        record.registered = true;
+        record.registrationError = undefined;
+      });
+    } else {
+      available.forEach((record) => { record.registrationError = `批次自动登记存在 ${totalFailed} 条失败，可稍后手动登记。`; });
+    }
+    addLog(`${batchLabel} 自动登记：成功 ${totalSuccess}，失败 ${totalFailed}。`, totalFailed ? "自动登记失败" : "自动登记");
   }
 
   function handleDriveLoaderMessage(event) {
@@ -1504,9 +1621,9 @@ export function bootNotebookApp(): void {
     setStage("正在检查新来源…");
     render();
     try {
-      const cachedSourceIds = state.records
+      const cachedSourceIds = Array.from(new Set(state.records
         .filter((record) => record.sourceId && record.transcript && !record.error)
-        .map((record) => record.sourceId);
+        .map((record) => record.sourceId)));
       const result = await callPageApi("extract-existing-sources", {
         skipSourceIds: cachedSourceIds
       }, API_TIMEOUT_MS);
@@ -1522,8 +1639,9 @@ export function bootNotebookApp(): void {
         ? (state.translateEnabled ? "新来源提取与翻译完成" : "新来源提取完成")
         : `没有新来源，已跳过 ${skipped} 个`);
     } catch (error) {
-      setStage("提取失败");
-      addLog(error.message || String(error), "失败");
+      const message = error instanceof Error ? error.message : String(error);
+      setStage(`提取失败：${message}`);
+      addLog(message, "失败");
     } finally {
       state.isBusy = false;
       render();
@@ -1566,6 +1684,10 @@ export function bootNotebookApp(): void {
         : summary.translated
         ? `AI 翻译完成：成功 ${summary.translated}`
         : "没有可进行 AI 翻译的来源");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStage(message);
+      addLog(message, "AI 翻译已暂停");
     } finally {
       state.isBusy = false;
       render();
@@ -1583,9 +1705,10 @@ export function bootNotebookApp(): void {
 
     const originalSelection = captureSourceSelection(document);
     try {
-      for (let offset = 0; offset < records.length; offset += AI_TRANSLATION_BATCH_SIZE) {
-        const batch = records.slice(offset, offset + AI_TRANSLATION_BATCH_SIZE);
-        const batchLabel = `${Math.floor(offset / AI_TRANSLATION_BATCH_SIZE) + 1}/${Math.ceil(records.length / AI_TRANSLATION_BATCH_SIZE)}`;
+      const batchSize = normalizeAiTranslationBatchSize(state.translationBatchSize);
+      for (let offset = 0; offset < records.length; offset += batchSize) {
+        const batch = records.slice(offset, offset + batchSize);
+        const batchLabel = `${Math.floor(offset / batchSize) + 1}/${Math.ceil(records.length / batchSize)}`;
         setStage(`AI 翻译批次 ${batchLabel}（${batch.length} 个来源）…`);
         addLog(`AI 翻译批次 ${batchLabel}：准备 ${batch.length} 个已有转录来源。`, "AI 翻译");
         const batchSummary = await translateAiBatchWithRecovery(batch, batchLabel);
@@ -1645,6 +1768,7 @@ export function bootNotebookApp(): void {
       } catch (error) {
         lastError = error && error.message ? error.message : String(error);
         addLog(`批次 ${batchLabel} 第 ${attempt + 1} 次请求失败：${lastError}`, "AI 翻译失败");
+        if (error instanceof AiTranslationPageStateError) throw error;
       }
     }
 
@@ -1672,12 +1796,52 @@ export function bootNotebookApp(): void {
   }
 
   async function submitNotebookAiTranslationPrompt() {
-    const input = findChatInput(document, state.root);
+    let input = findChatInput(document, state.root);
+    if (!input) {
+      await waitForCondition(() => Boolean(findChatInput(document, state.root)), 30_000, 250);
+      input = findChatInput(document, state.root);
+    }
     const chatPanel = findChatPanel(input, document);
-    if (!input) throw new Error("未找到 NotebookLM 对话输入框，请确认笔记本页面已加载完成后重试。");
+    if (!input) {
+      const generating = isNotebookAiGenerating(document, findChatPanel(null, document), state.root);
+      throw new AiTranslationPageStateError(generating
+        ? "NotebookLM 仍在生成上一批回答，AI 翻译队列已暂停；请等待回答完成后再继续。"
+        : "未找到 NotebookLM 对话输入框，AI 翻译队列已暂停；请确认笔记本页面加载完成后重试。");
+    }
     const knownPayloads = new Set<string>(getAiResponseTexts(chatPanel || document)
       .flatMap((text) => extractJsonArrayCandidates(text).map((item) => item.raw)));
+    const knownResponseCount = getAiResponseTexts(chatPanel || document).length;
+    const knownUserMessageCount = getUserMessageTexts(chatPanel || document).length;
     const prompt = buildTranslationPrompt();
+    let started = await dispatchNotebookAiPrompt(
+      input,
+      chatPanel,
+      prompt,
+      knownUserMessageCount,
+      knownResponseCount
+    );
+    if (!started) {
+      addLog("NotebookLM 第一次没有接受翻译提示，正在自动重填并重发。", "AI 翻译重发");
+      input = findChatInput(document, state.root);
+      if (input) {
+        started = await dispatchNotebookAiPrompt(
+          input,
+          chatPanel,
+          prompt,
+          knownUserMessageCount,
+          knownResponseCount
+        );
+      }
+    }
+    if (!started) {
+      throw new AiTranslationPageStateError(
+        "NotebookLM 未接受翻译提示，AI 翻译队列已暂停；请确认对话框可正常发送后重试。"
+      );
+    }
+    return waitForNotebookAiJson(chatPanel || document, knownPayloads, knownResponseCount);
+  }
+
+  async function dispatchNotebookAiPrompt(input, chatPanel, prompt, knownUserMessageCount, knownResponseCount) {
     setNativeTextareaValue(input, prompt);
     input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: prompt }));
     input.dispatchEvent(new Event("change", { bubbles: true }));
@@ -1686,11 +1850,16 @@ export function bootNotebookApp(): void {
       const submit = findChatSubmit(input, chatPanel, document, state.root);
       return Boolean(submit && !submit.disabled);
     }, 6000, 100);
-    if (!ready) throw new Error("NotebookLM 未能启用发送按钮，请确认页面已加载完成。");
+    if (!ready) return false;
     const submit = findChatSubmit(input, chatPanel, document, state.root);
-    if (!submit) throw new Error("未找到 NotebookLM 对话发送按钮，请刷新页面后重试。");
+    if (!submit) return false;
     submit.click();
-    return waitForNotebookAiJson(chatPanel || document, knownPayloads);
+    return waitForCondition(() => {
+      const responseRoot = chatPanel || document;
+      return getUserMessageTexts(responseRoot).length > knownUserMessageCount ||
+        getAiResponseTexts(responseRoot).length > knownResponseCount ||
+        isNotebookAiGenerating(document, findChatPanel(null, document), state.root);
+    }, 12_000, 200);
   }
 
   function setNativeTextareaValue(textarea, value) {
@@ -1699,12 +1868,18 @@ export function bootNotebookApp(): void {
     descriptor.set.call(textarea, value);
   }
 
-  async function waitForNotebookAiJson(chatPanel, knownPayloads) {
+  async function waitForNotebookAiJson(chatPanel, knownPayloads, knownResponseCount) {
     const deadline = Date.now() + AI_TRANSLATION_TIMEOUT_MS;
     let stableRaw = "";
     let stableSince = 0;
+    let responseStarted = false;
+    let generationObserved = false;
     while (Date.now() < deadline) {
-      const candidates = getAiResponseTexts(chatPanel)
+      const responseTexts = getAiResponseTexts(chatPanel);
+      if (responseTexts.length > knownResponseCount) responseStarted = true;
+      const generating = isNotebookAiGenerating(document, findChatPanel(null, document), state.root);
+      if (generating) generationObserved = true;
+      const candidates = responseTexts
         .flatMap((text) => extractJsonArrayCandidates(text))
         .filter((item) => !knownPayloads.has(item.raw))
         .filter((item) => item.value.some((row) => {
@@ -1718,11 +1893,15 @@ export function bootNotebookApp(): void {
         if (newest.raw !== stableRaw) {
           stableRaw = newest.raw;
           stableSince = Date.now();
-        } else if (Date.now() - stableSince >= AI_TRANSLATION_SETTLE_MS) {
+        } else if ((responseStarted || generationObserved) && !generating &&
+          Date.now() - stableSince >= AI_TRANSLATION_SETTLE_MS && findChatInput(document, state.root)) {
           return newest.value;
         }
       }
       await wait(AI_TRANSLATION_POLL_MS);
+    }
+    if (isNotebookAiGenerating(document, findChatPanel(null, document), state.root)) {
+      throw new AiTranslationPageStateError("NotebookLM 在等待时限内仍未生成完回答，AI 翻译队列已暂停；当前批次不会跳过，请稍后重试。");
     }
     throw new Error("等待 NotebookLM AI 翻译超时，未收到完整 JSON 结果。");
   }
@@ -1767,49 +1946,50 @@ export function bootNotebookApp(): void {
     addLog("请求已发送，等待表格服务响应。", "登记");
     render();
     const records = toSheetRecords(available, sourceNameToPostId);
-    const totalBatches = Math.ceil(records.length / SHEET_REGISTRATION_BATCH_SIZE);
+    const batches = chunkSheetRegistrationRecords(records, databaseUrl);
+    const totalBatches = batches.length;
     const statusCounts = Object.create(null);
     const failureLogs: Array<{ title: string; message: string }> = [];
     let totalSuccess = 0;
     let totalFailed = 0;
+    let requestCount = 0;
+    let batchStart = 0;
 
     try {
       for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
-        const batchStart = batchIndex * SHEET_REGISTRATION_BATCH_SIZE;
-        const batchRecords = records.slice(batchStart, batchStart + SHEET_REGISTRATION_BATCH_SIZE);
+        const batchRecords = batches[batchIndex];
         const batchLabel = `${batchIndex + 1}/${totalBatches}`;
-        setStage(`正在登记批次 ${batchLabel}（${batchRecords.length} 条）…`);
-        addLog(`批次 ${batchLabel} 已发送，共 ${batchRecords.length} 条。`, "登记");
+        setStage(`正在登记批次 ${batchLabel}（${batchRecords.length} 条，已按请求大小拆分）…`);
+        addLog(`批次 ${batchLabel} 准备发送，共 ${batchRecords.length} 条。`, "登记");
         render();
 
-        try {
-          const result = await callSheetUpsert(databaseUrl, batchRecords);
-          const analysis = analyzeBatchResponse(result as any, batchRecords, { batchStart, batchLabel });
+        const attempts = await submitSheetBatchAdaptive(databaseUrl, batchRecords, batchStart, batchLabel);
+        requestCount += attempts.length;
+        attempts.forEach((attempt) => {
+          if (attempt.error) {
+            totalFailed += attempt.records.length;
+            addStatusCount(statusCounts, "request_failed", attempt.records.length);
+            failureLogs.push({
+              title: `批次 ${attempt.batchLabel} 请求失败`,
+              message: formatSheetRequestError(attempt.error, attempt.records)
+            });
+            return;
+          }
+          const analysis = analyzeBatchResponse(attempt.result as any, attempt.records, {
+            batchStart: attempt.batchStart,
+            batchLabel: attempt.batchLabel
+          });
           mergeStatusCounts(statusCounts, analysis.statusCounts);
           totalSuccess += analysis.success;
           totalFailed += analysis.failed;
           failureLogs.push(...analysis.failureLogs);
           if (analysis.requestFailed) {
-            addLog(`批次 ${batchLabel} 请求失败，已继续下一批。`, "登记失败");
-            continue;
+            addLog(`批次 ${attempt.batchLabel} 请求失败，已继续下一批。`, "登记失败");
+            return;
           }
-          addLog(`批次 ${batchLabel} 完成：成功 ${analysis.success}，失败 ${analysis.failed}。`, "批次汇总");
-        } catch (error) {
-          const details = error.details || {};
-          totalFailed += batchRecords.length;
-          addStatusCount(statusCounts, "request_failed", batchRecords.length);
-          failureLogs.push({
-            title: `批次 ${batchLabel} 请求失败`,
-            message: [
-              `error.code: ${details.code || "REQUEST_FAILED"}`,
-              `http_status: ${details.http_status || "未知"}`,
-              `message: ${error.message || String(error)}`,
-              details.response_preview ? `response_preview: ${details.response_preview}` : "",
-              `未登记 post_id：${batchRecords.map((record) => record.post_id).join("、")}`
-            ].filter(Boolean).join("\n")
-          });
-          addLog(`批次 ${batchLabel} 请求异常，已继续下一批。`, "登记失败");
-        }
+          addLog(`批次 ${attempt.batchLabel} 完成：成功 ${analysis.success}，失败 ${analysis.failed}。`, "批次汇总");
+        });
+        batchStart += batchRecords.length;
         render();
       }
 
@@ -1818,7 +1998,7 @@ export function bootNotebookApp(): void {
       const hiddenFailureCount = failureLogs.length - visibleFailures.length;
       state.logs = [
         { message: formatStatusCounts(statusCounts), kind: "status_counts", time: logTime },
-        { message: `共 ${records.length} 条，${totalBatches} 批；成功 ${totalSuccess}，失败 ${totalFailed}。`, kind: "登记汇总", time: logTime },
+        { message: `共 ${records.length} 条，发出 ${requestCount} 个请求；成功 ${totalSuccess}，失败 ${totalFailed}。`, kind: "登记汇总", time: logTime },
         ...(hiddenFailureCount ? [{ message: `失败明细较多，当前显示前 ${visibleFailures.length} 条，另有 ${hiddenFailureCount} 条未展开。`, kind: "显示限制", time: logTime }] : []),
         ...visibleFailures.map((entry) => ({ message: entry.message, kind: entry.title, time: logTime }))
       ].slice(0, MAX_LOGS);
@@ -1838,6 +2018,42 @@ export function bootNotebookApp(): void {
 
   function callSheetUpsert(databaseUrl, records) {
     return extensionClient.upsertSheet({ databaseUrl, records });
+  }
+
+  async function submitSheetBatchAdaptive(databaseUrl, records, batchStart, batchLabel) {
+    try {
+      const result = await callSheetUpsert(databaseUrl, records);
+      if (isSheetRequestTooLarge(result) && records.length > 1) {
+        return splitOversizedSheetBatch(databaseUrl, records, batchStart, batchLabel);
+      }
+      return [{ records, batchStart, batchLabel, result }];
+    } catch (error) {
+      if (isSheetRequestTooLarge(error) && records.length > 1) {
+        return splitOversizedSheetBatch(databaseUrl, records, batchStart, batchLabel);
+      }
+      return [{ records, batchStart, batchLabel, error }];
+    }
+  }
+
+  async function splitOversizedSheetBatch(databaseUrl, records, batchStart, batchLabel) {
+    const splitAt = Math.ceil(records.length / 2);
+    const left = records.slice(0, splitAt);
+    const right = records.slice(splitAt);
+    addLog(`批次 ${batchLabel} 超过服务请求大小限制，自动拆分为 ${left.length} 条和 ${right.length} 条重试。`, "登记自动拆分");
+    const leftResults = await submitSheetBatchAdaptive(databaseUrl, left, batchStart, `${batchLabel}.1`);
+    const rightResults = await submitSheetBatchAdaptive(databaseUrl, right, batchStart + left.length, `${batchLabel}.2`);
+    return [...leftResults, ...rightResults];
+  }
+
+  function formatSheetRequestError(error, records) {
+    const details = error?.details || {};
+    return [
+      `error.code: ${details.code || (isSheetRequestTooLarge(error) ? "REQUEST_TOO_LARGE" : "REQUEST_FAILED")}`,
+      `http_status: ${details.http_status || (isSheetRequestTooLarge(error) ? 413 : "未知")}`,
+      `message: ${error?.message || String(error)}`,
+      details.response_preview ? `response_preview: ${details.response_preview}` : "",
+      `未登记 post_id：${summarizeSheetPostIds(records)}`
+    ].filter(Boolean).join("\n");
   }
 
   async function copyTable() {
@@ -1895,6 +2111,9 @@ export function bootNotebookApp(): void {
     const translateToggle = panelQuery<HTMLInputElement>("[data-role='translate-toggle']");
     translateToggle.checked = state.translateEnabled;
     translateToggle.disabled = state.isBusy;
+    const translationBatchInput = panelQuery<HTMLInputElement>("[data-role='translation-batch-size']");
+    translationBatchInput.value = String(state.translationBatchSize);
+    translationBatchInput.disabled = state.isBusy;
     const autoDeleteToggle = panelQuery<HTMLInputElement>("[data-role='auto-delete-toggle']");
     autoDeleteToggle.checked = state.autoDeleteImported;
     autoDeleteToggle.disabled = state.isBusy;
@@ -2180,6 +2399,7 @@ export function bootNotebookApp(): void {
   async function savePanelSettings() {
     const settings: PanelSettings = {
       aiTranslationEnabled: state.translateEnabled,
+      aiTranslationBatchSize: state.translationBatchSize,
       autoDeleteImported: state.autoDeleteImported,
       autoRegisterImported: state.autoRegisterImported,
       driveBatchSize: state.driveBatchSize,
