@@ -448,7 +448,7 @@
   align-items: center;
   display: grid;
   gap: 0;
-  grid-template-columns: 20px minmax(70px, .8fr) minmax(120px, 1.65fr) minmax(58px, .65fr);
+  grid-template-columns: 20px minmax(62px, .8fr) minmax(105px, 1.5fr) minmax(52px, .55fr) minmax(52px, .55fr);
   min-width: 0;
   padding: 0;
 }

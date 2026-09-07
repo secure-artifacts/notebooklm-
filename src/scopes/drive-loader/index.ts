@@ -28,6 +28,18 @@ import { notebookOrigins } from "@/const";
 
   const bridgeToken = new URLSearchParams(location.hash.slice(1)).get("token") || "";
   window.addEventListener("message", handleMessage);
+  postReady();
+
+  function postReady() {
+    for (const origin of notebookOrigins) {
+      parent.postMessage({
+        source: APP_ID,
+        target: "content",
+        type: "drive-loader-ready",
+        token: bridgeToken
+      }, origin);
+    }
+  }
 
   function handleMessage(event) {
     if (event.source !== parent || !notebookOrigins.has(event.origin)) return;

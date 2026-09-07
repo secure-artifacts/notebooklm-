@@ -17,7 +17,7 @@ import {
   normalizeBatchSize,
   parseDriveUrls
 } from "@/lib/driveImport";
-import { completedSourceIdsForCleanup, partitionInterruptedSourceIds } from "@/lib/importCleanup";
+import { completedSourceIdsForCleanup } from "@/lib/importCleanup";
 import {
   isFacebookTableRowPopulated,
   parseFacebookClipboardRows,
@@ -95,6 +95,12 @@ import type { NotebookAction } from "./apiClient";
       this.name = "AiTranslationPageStateError";
     }
   }
+  class AiTranslationPauseError extends Error {
+    constructor() {
+      super("已按请求暂停 AI 翻译");
+      this.name = "AiTranslationPauseError";
+    }
+  }
   const MAX_LOGS = 240;
   const DRIVE_BRIDGE_TOKEN = typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
@@ -123,12 +129,16 @@ import type { NotebookAction } from "./apiClient";
     root: HTMLElement;
   };
 
+  type FacebookStatusKind = "idle" | "working" | "success" | "error";
+
   type FacebookInputRow = {
     key: number;
     postId: string;
     url: string;
-    status: string;
-    statusKind: "idle" | "working" | "success" | "error";
+    transcriptStatus: string;
+    transcriptStatusKind: FacebookStatusKind;
+    translationStatus: string;
+    translationStatusKind: FacebookStatusKind;
     selected: boolean;
     persistedTaskId?: string;
   };
@@ -173,6 +183,7 @@ import type { NotebookAction } from "./apiClient";
   const activeDriveUploads = new Map<string, { position: string; fileName: string }>();
   let driveLoaderFrame: HTMLIFrameElement = null!;
   let driveLoaderReady: Promise<void> | null = null;
+  let resolveDriveLoaderReady: (() => void) | null = null;
   let initialized = false;
   let activeNotebookId = "";
   let routeTimerId = 0;
@@ -288,6 +299,7 @@ export function bootNotebookApp(): void {
     if (driveLoaderFrame) driveLoaderFrame.remove();
     driveLoaderFrame = null!;
     driveLoaderReady = null;
+    resolveDriveLoaderReady = null;
     state.records = [];
     state.logs = [];
     state.isBusy = false;
@@ -335,7 +347,7 @@ export function bootNotebookApp(): void {
             </section>
             <section class="nlm-import-pane" data-role="facebook-pane" role="tabpanel">
               <div class="nlm-facebook-grid" role="grid" aria-label="Facebook 导入任务表" title="可像表格一样拖选、复制并粘贴两列数据">
-                <div class="nlm-facebook-grid-head" role="row"><span></span><b>贴文 ID</b><b>Facebook 链接</b><b>状态</b></div>
+                <div class="nlm-facebook-grid-head" role="row"><span></span><b>贴文 ID</b><b>Facebook 链接</b><b>缅文转录</b><b>中文翻译</b></div>
                 <div class="nlm-facebook-grid-body" data-role="facebook-grid-body"></div>
               </div>
               <div class="nlm-facebook-table-footer nlm-facebook-table-toolbar">
@@ -490,8 +502,8 @@ export function bootNotebookApp(): void {
       if (button.dataset.action === "cancel-facebook") {
         if (state.facebookActive) {
           facebookPauseRequested = true;
-          setStage("将在当前批次完成后暂停…");
-          addLog("已请求暂停；为避免重复来源，将在当前批次完成并保存检查点后暂停。", "暂停");
+          setStage("将在当前转录或 AI 翻译完成后暂停…");
+          addLog("已请求暂停；当前正在翻译时只等待当前一次回答，不再开始后续翻译。转录和翻译状态会分别保存。", "暂停");
           render();
         }
         return;
@@ -509,9 +521,25 @@ export function bootNotebookApp(): void {
     bindDatabaseUrlInput();
   }
 
-  function createFacebookInputRow(postId = "", url = "", status = "待填写"): FacebookInputRow {
+  function createFacebookInputRow(postId = "", url = ""): FacebookInputRow {
     facebookRowSequence += 1;
-    return { key: facebookRowSequence, postId, url, status, statusKind: "idle", selected: false };
+    return {
+      key: facebookRowSequence,
+      postId,
+      url,
+      transcriptStatus: postId.trim() || url.trim() ? "待转录" : "待填写",
+      transcriptStatusKind: "idle",
+      translationStatus: state.translateEnabled ? "等待转录" : "未开启",
+      translationStatusKind: "idle",
+      selected: false
+    };
+  }
+
+  function resetFacebookRowProgress(row: FacebookInputRow) {
+    row.transcriptStatus = row.postId.trim() || row.url.trim() ? "待转录" : "待填写";
+    row.transcriptStatusKind = "idle";
+    row.translationStatus = state.translateEnabled ? "等待转录" : "未开启";
+    row.translationStatusKind = "idle";
   }
 
   function ensureFacebookEditorRows(minimum = 1) {
@@ -534,8 +562,7 @@ export function bootNotebookApp(): void {
     if (!row) return;
     if (input.dataset.facebookField === "postId") row.postId = input.value;
     if (input.dataset.facebookField === "url") row.url = input.value;
-    row.status = row.postId.trim() || row.url.trim() ? "待校验" : "待填写";
-    row.statusKind = "idle";
+    resetFacebookRowProgress(row);
   }
 
   function handleFacebookGridChange(event: Event) {
@@ -572,8 +599,7 @@ export function bootNotebookApp(): void {
       } else {
         row.postId = cells.postId;
       }
-      row.status = "待校验";
-      row.statusKind = "idle";
+      resetFacebookRowProgress(row);
     });
     renderFacebookTable();
     const accepted = Math.min(pasted.length, available);
@@ -666,8 +692,7 @@ export function bootNotebookApp(): void {
       event.preventDefault();
       state.facebookRows.slice(bounds.rowStart, bounds.rowEnd + 1).forEach((row) => {
         bounds.columns.slice(bounds.columnStart, bounds.columnEnd + 1).forEach((column) => { row[column] = ""; });
-        row.status = row.postId.trim() || row.url.trim() ? "待校验" : "待填写";
-        row.statusKind = "idle";
+        resetFacebookRowProgress(row);
       });
       renderFacebookTable();
       setStage(`已清空 ${cellCount} 个 Facebook 表格单元格`);
@@ -717,7 +742,10 @@ export function bootNotebookApp(): void {
   }
 
   async function deleteSuccessfulFacebookRows() {
-    const rows = state.facebookRows.filter((row) => isPopulatedFacebookRow(row) && row.statusKind === "success");
+    const translationRequired = facebookJob?.translate ?? state.translateEnabled;
+    const rows = state.facebookRows.filter((row) => isPopulatedFacebookRow(row) &&
+      row.transcriptStatusKind === "success" &&
+      (!translationRequired || row.translationStatusKind === "success"));
     if (!rows.length) return setStage("当前没有可删除的成功任务");
     await removeFacebookRows(rows, "已删除成功任务");
   }
@@ -730,8 +758,10 @@ export function bootNotebookApp(): void {
     const rows = state.facebookRows.filter((row) => row.selected && isPopulatedFacebookRow(row));
     if (!rows.length) return setStage("请先勾选要重试的 Facebook 任务");
     rows.forEach((row) => {
-      row.status = "等待重试";
-      row.statusKind = "idle";
+      row.transcriptStatus = "等待重试";
+      row.transcriptStatusKind = "idle";
+      row.translationStatus = state.translateEnabled ? "等待转录" : "未开启";
+      row.translationStatusKind = "idle";
       row.selected = false;
     });
     renderFacebookTable();
@@ -747,13 +777,14 @@ export function bootNotebookApp(): void {
     const body = panelQuery<HTMLElement>("[data-role='facebook-grid-body']");
     body.innerHTML = state.facebookRows.map((row, index) => {
       const issue = issues.get(index);
-      const status = issue || row.status;
-      const kind = issue ? "error" : row.statusKind;
+      const transcriptStatus = issue || row.transcriptStatus;
+      const transcriptKind = issue ? "error" : row.transcriptStatusKind;
       return `<div class="nlm-facebook-grid-row ${row.selected ? "is-selected" : ""} ${issue ? "has-error" : ""}" role="row" data-row-key="${row.key}">
         <label><input type="checkbox" data-facebook-select data-row-key="${row.key}" ${row.selected ? "checked" : ""} ${state.isBusy ? "disabled" : ""} aria-label="选择第 ${index + 1} 行"></label>
         <input type="text" data-facebook-field="postId" data-row-key="${row.key}" value="${escapeHtml(row.postId)}" placeholder="贴文 ID" spellcheck="false" ${state.isBusy ? "disabled" : ""}>
         <input type="url" data-facebook-field="url" data-row-key="${row.key}" value="${escapeHtml(row.url)}" placeholder="https://facebook.com/..." spellcheck="false" ${state.isBusy ? "disabled" : ""}>
-        <span class="nlm-facebook-row-status is-${kind}" title="${escapeHtml(status)}">${escapeHtml(status)}</span>
+        <span class="nlm-facebook-row-status is-${transcriptKind}" data-facebook-status="transcript" title="${escapeHtml(transcriptStatus)}">${escapeHtml(transcriptStatus)}</span>
+        <span class="nlm-facebook-row-status is-${row.translationStatusKind}" data-facebook-status="translation" title="${escapeHtml(row.translationStatus)}">${escapeHtml(row.translationStatus)}</span>
       </div>`;
     }).join("");
     const populatedRows = state.facebookRows.filter(isPopulatedFacebookRow);
@@ -765,36 +796,59 @@ export function bootNotebookApp(): void {
     selectAll.indeterminate = selectedPopulated.length > 0 && !selectAll.checked;
     selectAll.disabled = state.isBusy || !populatedRows.length;
     panelQuery<HTMLButtonElement>("[data-action='facebook-delete-all']").disabled = state.isBusy || !populatedRows.length;
-    panelQuery<HTMLButtonElement>("[data-action='facebook-delete-success']").disabled = state.isBusy || !populatedRows.some((row) => row.statusKind === "success");
+    const translationRequired = facebookJob?.translate ?? state.translateEnabled;
+    panelQuery<HTMLButtonElement>("[data-action='facebook-delete-success']").disabled = state.isBusy || !populatedRows.some((row) =>
+      row.transcriptStatusKind === "success" && (!translationRequired || row.translationStatusKind === "success"));
     panelQuery<HTMLButtonElement>("[data-action='facebook-retry-selected']").disabled = state.isBusy || !selectedPopulated.length;
     updateFacebookCellSelectionDom();
   }
 
-  function setFacebookTaskStatuses(
+  function setFacebookTaskTranscriptionStatuses(
     tasks: Array<{ postId: string; url: string }>,
     status: string,
-    statusKind: FacebookInputRow["statusKind"],
+    statusKind: FacebookStatusKind,
     shouldRender = true
   ) {
     const taskKeys = new Set(tasks.map((task) => `${stripSourceSuffix(task.postId)}\n${task.url}`));
     const changedRows: FacebookInputRow[] = [];
     state.facebookRows.forEach((row) => {
       if (taskKeys.has(`${stripSourceSuffix(row.postId)}\n${row.url}`)) {
-        row.status = status;
-        row.statusKind = statusKind;
+        row.transcriptStatus = status;
+        row.transcriptStatusKind = statusKind;
         changedRows.push(row);
       }
     });
     if (shouldRender) renderFacebookTable();
-    else changedRows.forEach(updateFacebookRowStatusDom);
+    else changedRows.forEach((row) => updateFacebookRowStatusDom(row, "transcript"));
   }
 
-  function updateFacebookRowStatusDom(row: FacebookInputRow) {
-    const status = state.root?.querySelector<HTMLElement>(`.nlm-facebook-grid-row[data-row-key="${row.key}"] .nlm-facebook-row-status`);
+  function setFacebookTaskTranslationStatuses(
+    tasks: Array<{ postId: string; url: string }>,
+    status: string,
+    statusKind: FacebookStatusKind,
+    shouldRender = true
+  ) {
+    const taskKeys = new Set(tasks.map((task) => `${stripSourceSuffix(task.postId)}\n${task.url}`));
+    const changedRows: FacebookInputRow[] = [];
+    state.facebookRows.forEach((row) => {
+      if (taskKeys.has(`${stripSourceSuffix(row.postId)}\n${row.url}`)) {
+        row.translationStatus = status;
+        row.translationStatusKind = statusKind;
+        changedRows.push(row);
+      }
+    });
+    if (shouldRender) renderFacebookTable();
+    else changedRows.forEach((row) => updateFacebookRowStatusDom(row, "translation"));
+  }
+
+  function updateFacebookRowStatusDom(row: FacebookInputRow, phase: "transcript" | "translation") {
+    const status = state.root?.querySelector<HTMLElement>(`.nlm-facebook-grid-row[data-row-key="${row.key}"] [data-facebook-status="${phase}"]`);
     if (!status) return;
-    status.className = `nlm-facebook-row-status is-${row.statusKind}`;
-    status.textContent = row.status;
-    status.title = row.status;
+    const value = phase === "transcript" ? row.transcriptStatus : row.translationStatus;
+    const kind = phase === "transcript" ? row.transcriptStatusKind : row.translationStatusKind;
+    status.className = `nlm-facebook-row-status is-${kind}`;
+    status.textContent = value;
+    status.title = value;
   }
 
   async function importFacebookMedia(inputRows: FacebookInputRow[] = state.facebookRows) {
@@ -875,12 +929,24 @@ export function bootNotebookApp(): void {
     render();
 
     let activeBatchRecords: TranscriptRecord[] = [];
-    let activeBatchTaskCount = 0;
     try {
       let queueBatchSequence = 0;
+      if (canResume) {
+        const resumableRecords = state.records.filter((record) => record.sourceId && record.transcript &&
+          !record.error && !record.sourceDeleted);
+        const pendingTranslations = resumableRecords.filter((record) => !record.translation);
+        if (job.translate && resumableRecords.length) {
+          if (pendingTranslations.length) {
+            addLog(`先继续上次暂停时保留的 ${pendingTranslations.length} 个中文翻译，再导入新来源。`, "恢复翻译");
+          }
+          const shouldStop = await translateFacebookRecords(job, resumableRecords, databaseUrl, "恢复翻译");
+          if (shouldStop) facebookPauseRequested = true;
+        } else if (!job.translate && resumableRecords.length) {
+          await finalizeFacebookRecords(job, resumableRecords, databaseUrl, "恢复转录");
+        }
+      }
       while (job.nextIndex < job.tasks.length && !facebookPauseRequested) {
         activeBatchRecords = [];
-        activeBatchTaskCount = 0;
         const summary = await getNotebookSourceSummary();
         const batch = nextFacebookBatch(job, summary.totalSources);
         if (!batch.length) {
@@ -890,7 +956,8 @@ export function bootNotebookApp(): void {
         const batchLabel = `${queueBatchSequence}（${job.nextIndex + 1}-${job.nextIndex + batch.length}/${job.tasks.length}）`;
         setStage(`Facebook 批次 ${batchLabel}：处理 ${batch.length} 条…`);
         addLog(`批次 ${batchLabel} 开始；当前来源 ${summary.totalSources}/${NOTEBOOK_SOURCE_LIMIT}。`, "Facebook 批次");
-        setFacebookTaskStatuses(batch, "处理中", "working");
+        setFacebookTaskTranscriptionStatuses(batch, "处理中", "working");
+        setFacebookTaskTranslationStatuses(batch, job.translate ? "等待转录" : "未开启", "idle");
 
         job.activeBatchStart = job.nextIndex;
         job.activeSourceIds = [];
@@ -907,7 +974,7 @@ export function bootNotebookApp(): void {
               processing: "等待转录",
               completed: "导入完成"
             };
-            setFacebookTaskStatuses(
+            setFacebookTaskTranscriptionStatuses(
               [task],
               taskStatus === "failed" ? `失败：${message || "任务失败"}` : labels[taskStatus] || "处理中",
               taskStatus === "failed" ? "error" : taskStatus === "completed" ? "success" : "working",
@@ -924,50 +991,46 @@ export function bootNotebookApp(): void {
         const added = mergeRecords(records);
         const batchRecords = resolveMergedRecords(records);
         activeBatchRecords = batchRecords;
-        activeBatchTaskCount = batch.length;
         const failed = batchRecords.filter((record) => record.error || !record.transcript).length;
         batch.forEach((task) => {
           const record = batchRecords.find((item) => stripSourceSuffix(item.sourceName) === stripSourceSuffix(task.postId));
           const failedTask = Boolean(record?.error || !record?.transcript);
-          setFacebookTaskStatuses(
+          setFacebookTaskTranscriptionStatuses(
             [task],
-            failedTask ? `失败：${record?.error || "未返回转录"}` : "导入完成",
+            failedTask ? `失败：${record?.error || "未返回转录"}` : "已转录",
             failedTask ? "error" : "success",
+            false
+          );
+          setFacebookTaskTranslationStatuses(
+            [task],
+            failedTask ? (job.translate ? "已跳过" : "未开启") : (job.translate ? "待翻译" : "未开启"),
+            failedTask && job.translate ? "error" : "idle",
             false
           );
         });
         renderFacebookTable();
 
-        if (job.translate && added) {
-          await translateRecords({ sourceIds: batchRecords.map((record) => record.sourceId).filter(Boolean) });
-        }
-        if (job.autoRegister) {
-          await autoRegisterImportBatch(batchRecords, databaseUrl, `Facebook ${batchLabel}`);
-        }
-        if (job.autoDelete) {
-          const sourceIds = completedSourceIdsForCleanup(batchRecords, job.translate);
-          if (sourceIds.length) await deleteImportedBatch(sourceIds, batchLabel);
-          const retainedCompleted = batchRecords.filter((record) => record.sourceId && record.transcript && !record.error).length - sourceIds.length;
-          if (retainedCompleted > 0) {
-            addLog(`批次 ${batchLabel} 保留 ${retainedCompleted} 个未完成翻译的来源，便于稍后重试。`, "来源保留");
-          }
-        }
-
+        // Transcription is the durable import checkpoint. Translation is resumed independently.
         job.nextIndex += batch.length;
         job.activeBatchStart = job.nextIndex;
         job.activeSourceIds = [];
         job.records = getFacebookJobRecords(job);
-        job.status = job.nextIndex >= job.tasks.length ? "completed" : "running";
+        job.status = job.nextIndex >= job.tasks.length && !job.translate ? "completed" : "running";
         job.lastError = undefined;
         await saveFacebookCheckpoint(batchRecords);
-        addLog(`批次 ${batchLabel} 完成：转录成功 ${added}，失败 ${failed}；总进度 ${job.nextIndex}/${job.tasks.length}。`, failed ? "完成（有失败）" : "批次完成");
+        addLog(`批次 ${batchLabel} 转录检查点已保存：成功 ${added}，失败 ${failed}；导入进度 ${job.nextIndex}/${job.tasks.length}。`, failed ? "转录完成（有失败）" : "转录完成");
+
+        const shouldStop = await translateFacebookRecords(job, batchRecords, databaseUrl, batchLabel);
+        if (shouldStop) facebookPauseRequested = true;
         render();
       }
 
-      if (facebookPauseRequested && job.nextIndex < job.tasks.length) {
+      const pendingTranslations = job.translate && state.records.some((record) => record.sourceId && record.transcript &&
+        !record.error && !record.translation && !record.sourceDeleted);
+      if (facebookPauseRequested || job.nextIndex < job.tasks.length || pendingTranslations) {
         job.status = "paused";
         await saveFacebookCheckpoint();
-        setStage(`Facebook 队列已暂停：${job.nextIndex}/${job.tasks.length}`);
+        setStage(`Facebook 队列已暂停：已转录 ${job.nextIndex}/${job.tasks.length}`);
       } else {
         job.status = "completed";
         await saveFacebookCheckpoint();
@@ -977,33 +1040,21 @@ export function bootNotebookApp(): void {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const userPaused = error instanceof AiTranslationPauseError;
       await facebookCoordinator?.cancel();
       if (facebookJob) {
-        const translationInterrupted = error instanceof AiTranslationPageStateError && activeBatchTaskCount > 0;
-        if (translationInterrupted) {
-          const partition = partitionInterruptedSourceIds(facebookJob.activeSourceIds, activeBatchRecords);
-          facebookJob.activeSourceIds = partition.orphaned;
-          if (facebookJob.autoDelete && facebookJob.activeSourceIds.length) {
-            await cleanupInterruptedFacebookSources(facebookJob);
-          }
-          facebookJob.nextIndex = Math.min(facebookJob.tasks.length, facebookJob.nextIndex + activeBatchTaskCount);
-          facebookJob.activeBatchStart = facebookJob.nextIndex;
-          facebookJob.records = getFacebookJobRecords(facebookJob);
-          addLog(
-            `AI 翻译暂停：已保留当前批次 ${partition.preserved.length} 个已导入来源，` +
-            `并将导入检查点推进到 ${facebookJob.nextIndex}/${facebookJob.tasks.length}，恢复时不会重复上传。` +
-            "等待当前回答结束后，可关闭再开启 AI 翻译开关补译这些记录。",
-            "来源保留"
-          );
-        } else if (facebookJob.autoDelete && facebookJob.activeSourceIds.length) {
+        if (facebookJob.autoDelete && facebookJob.activeSourceIds.length) {
           await cleanupInterruptedFacebookSources(facebookJob);
         }
         facebookJob.status = "paused";
-        facebookJob.lastError = message;
+        facebookJob.lastError = userPaused ? undefined : message;
         facebookJob.records = getFacebookJobRecords(facebookJob);
         await saveFacebookCheckpoint(activeBatchRecords);
+        syncFacebookRowsFromRecords(facebookJob);
       }
-      setStage(`${message} 已保存进度，可处理问题后继续。`);
+      setStage(userPaused
+        ? `Facebook 队列已暂停：已转录 ${facebookJob?.nextIndex || 0}/${facebookJob?.tasks.length || 0}`
+        : `${message} 已保存进度，可处理问题后继续。`);
       addLog(`${message}；检查点停在 ${facebookJob?.nextIndex || 0}/${facebookJob?.tasks.length || 0}。`, "队列暂停");
     } finally {
       facebookCoordinator = null;
@@ -1032,19 +1083,12 @@ export function bootNotebookApp(): void {
       }
       state.records = Array.isArray(facebookJob.records) ? facebookJob.records.slice() : [];
       if (state.root) {
-        state.facebookRows = facebookJob.tasks.map((task, index) => {
-          const record = facebookJob!.records.find((item) => stripSourceSuffix(item.sourceName) === stripSourceSuffix(task.postId));
-          const completed = index < facebookJob!.nextIndex;
-          const row = createFacebookInputRow(
-            task.postId,
-            task.url,
-            record?.error ? `失败：${record.error}` : completed ? "已处理" : "待处理"
-          );
-          row.statusKind = record?.error ? "error" : completed ? "success" : "idle";
+        state.facebookRows = facebookJob.tasks.map((task) => {
+          const row = createFacebookInputRow(task.postId, task.url);
           row.persistedTaskId = task.taskId;
           return row;
         });
-        renderFacebookTable();
+        syncFacebookRowsFromRecords(facebookJob);
       }
       state.stage = facebookJob.status === "completed"
         ? `已恢复已完成队列：${facebookJob.nextIndex}/${facebookJob.tasks.length}`
@@ -1152,6 +1196,113 @@ export function bootNotebookApp(): void {
     return state.records.filter((record) => sourceNames.has(record.sourceName)).map((record) => ({ ...record }));
   }
 
+  function facebookTasksForRecords(job: FacebookBulkJob, records: TranscriptRecord[]) {
+    const names = new Set(records.map((record) => stripSourceSuffix(record.sourceOriginalName || record.sourceName)));
+    return job.tasks.filter((task) => names.has(stripSourceSuffix(task.postId)));
+  }
+
+  function syncFacebookRowsFromRecords(job: FacebookBulkJob) {
+    const recordsByName = new Map(state.records.map((record) => [
+      stripSourceSuffix(record.sourceOriginalName || record.sourceName),
+      record
+    ]));
+    job.tasks.forEach((task, index) => {
+      const row = state.facebookRows.find((item) => item.persistedTaskId === task.taskId) ||
+        state.facebookRows.find((item) => stripSourceSuffix(item.postId) === stripSourceSuffix(task.postId));
+      if (!row) return;
+      const record = recordsByName.get(stripSourceSuffix(task.postId));
+      if (record?.error || (index < job.nextIndex && !record?.transcript)) {
+        row.transcriptStatus = `失败：${record?.error || "未返回转录"}`;
+        row.transcriptStatusKind = "error";
+        row.translationStatus = job.translate ? "已跳过" : "未开启";
+        row.translationStatusKind = job.translate ? "error" : "idle";
+        return;
+      }
+      if (record?.transcript) {
+        row.transcriptStatus = "已转录";
+        row.transcriptStatusKind = "success";
+        if (!job.translate) {
+          row.translationStatus = "未开启";
+          row.translationStatusKind = "idle";
+        } else if (record.translation) {
+          row.translationStatus = "已翻译";
+          row.translationStatusKind = "success";
+        } else if (record.translationError) {
+          row.translationStatus = `失败：${record.translationError}`;
+          row.translationStatusKind = "error";
+        } else {
+          row.translationStatus = "待翻译";
+          row.translationStatusKind = "idle";
+        }
+        return;
+      }
+      row.transcriptStatus = index < job.nextIndex ? "转录失败" : "待转录";
+      row.transcriptStatusKind = index < job.nextIndex ? "error" : "idle";
+      row.translationStatus = job.translate ? "等待转录" : "未开启";
+      row.translationStatusKind = "idle";
+    });
+    renderFacebookTable();
+  }
+
+  async function finalizeFacebookRecords(
+    job: FacebookBulkJob,
+    records: TranscriptRecord[],
+    databaseUrl: string,
+    batchLabel: string
+  ) {
+    const completed = records.filter((record) => record.transcript && !record.error &&
+      (!job.translate || Boolean(record.translation)));
+    if (job.autoRegister) {
+      const unregistered = completed.filter((record) => !record.registered);
+      if (unregistered.length) await autoRegisterImportBatch(unregistered, databaseUrl, `Facebook ${batchLabel}`);
+    }
+    if (job.autoDelete) {
+      const deletable = records.filter((record) => !record.sourceDeleted);
+      const sourceIds = completedSourceIdsForCleanup(deletable, job.translate);
+      if (sourceIds.length) await deleteImportedBatch(sourceIds, batchLabel);
+      const retained = records.filter((record) => record.sourceId && record.transcript && !record.error &&
+        !record.sourceDeleted && (!job.translate || !record.translation)).length;
+      if (retained > 0) {
+        addLog(`批次 ${batchLabel} 保留 ${retained} 个尚未完成中文翻译的来源。`, "来源保留");
+      }
+    }
+    job.records = getFacebookJobRecords(job);
+    await saveFacebookCheckpoint(records);
+    syncFacebookRowsFromRecords(job);
+  }
+
+  async function translateFacebookRecords(
+    job: FacebookBulkJob,
+    records: TranscriptRecord[],
+    databaseUrl: string,
+    batchLabel: string
+  ) {
+    const pending = records.filter((record) => record.sourceId && record.transcript && !record.error &&
+      !record.translation && !record.sourceDeleted);
+    if (!job.translate || !pending.length) {
+      await finalizeFacebookRecords(job, records, databaseUrl, batchLabel);
+      return false;
+    }
+    const summary = await translateRecords({
+      sourceIds: pending.map((record) => record.sourceId),
+      shouldPause: () => facebookPauseRequested,
+      onBatchStart: (translationBatch) => {
+        setFacebookTaskTranslationStatuses(facebookTasksForRecords(job, translationBatch), "翻译中", "working");
+      },
+      onBatchComplete: async (translationBatch) => {
+        job.records = getFacebookJobRecords(job);
+        syncFacebookRowsFromRecords(job);
+        await saveFacebookCheckpoint(translationBatch);
+      }
+    });
+    await finalizeFacebookRecords(job, records, databaseUrl, batchLabel);
+    const incomplete = pending.some((record) => !record.translation);
+    if (incomplete && !summary.paused) {
+      addLog(`${batchLabel} 仍有 ${pending.filter((record) => !record.translation).length} 个来源未完成中文翻译，队列已暂停以保留来源。`, "翻译待处理");
+    }
+    return summary.paused || incomplete;
+  }
+
   async function autoRegisterImportBatch(records: TranscriptRecord[], databaseUrl: string, batchLabel: string) {
     const available = records.filter((record) => record.transcript && !record.error);
     if (!available.length) {
@@ -1203,6 +1354,10 @@ export function bootNotebookApp(): void {
       event.origin !== extensionResources.extensionOrigin) return;
     const { source, target, type, token, requestId, payload } = event.data || {};
     if (source !== APP_ID || target !== "content" || token !== DRIVE_BRIDGE_TOKEN) return;
+    if (type === "drive-loader-ready") {
+      resolveDriveLoaderReady?.();
+      return;
+    }
     const pending = pendingDriveDownloads.get(requestId);
     if (!pending) return;
 
@@ -1554,13 +1709,22 @@ export function bootNotebookApp(): void {
     driveLoaderFrame.setAttribute("aria-hidden", "true");
     driveLoaderFrame.src = `${extensionResources.driveLoaderUrl}#token=${encodeURIComponent(DRIVE_BRIDGE_TOKEN)}`;
     driveLoaderReady = new Promise((resolve, reject) => {
-      const timeoutId = window.setTimeout(() => reject(new Error("Drive 下载组件加载超时。")), 15000);
-      driveLoaderFrame.addEventListener("load", () => {
+      const timeoutId = window.setTimeout(() => {
+        resolveDriveLoaderReady = null;
+        driveLoaderReady = null;
+        driveLoaderFrame?.remove();
+        driveLoaderFrame = null!;
+        reject(new Error("Drive 下载组件未就绪。请重新加载扩展；若仍失败，请确认加载的是最新 dist 目录。"));
+      }, 15000);
+      resolveDriveLoaderReady = () => {
         clearTimeout(timeoutId);
+        resolveDriveLoaderReady = null;
         resolve();
-      }, { once: true });
+      };
       driveLoaderFrame.addEventListener("error", () => {
         clearTimeout(timeoutId);
+        resolveDriveLoaderReady = null;
+        driveLoaderReady = null;
         reject(new Error("Drive 下载组件加载失败。"));
       }, { once: true });
     });
@@ -1694,7 +1858,12 @@ export function bootNotebookApp(): void {
     }
   }
 
-  async function translateRecords(options: { sourceIds?: string[] } = {}) {
+  async function translateRecords(options: {
+    sourceIds?: string[];
+    shouldPause?: () => boolean;
+    onBatchStart?: (records: TranscriptRecord[]) => void | Promise<void>;
+    onBatchComplete?: (records: TranscriptRecord[]) => void | Promise<void>;
+  } = {}) {
     const requestedSourceIds = new Set(Array.isArray(options.sourceIds) ? options.sourceIds.filter(Boolean) : []);
     const records = state.records.filter((record) => {
       if (!record.transcript || record.error || record.translation) return false;
@@ -1707,15 +1876,25 @@ export function bootNotebookApp(): void {
     try {
       const batchSize = normalizeAiTranslationBatchSize(state.translationBatchSize);
       for (let offset = 0; offset < records.length; offset += batchSize) {
+        if (options.shouldPause?.()) {
+          summary.paused = true;
+          break;
+        }
         const batch = records.slice(offset, offset + batchSize);
         const batchLabel = `${Math.floor(offset / batchSize) + 1}/${Math.ceil(records.length / batchSize)}`;
         setStage(`AI 翻译批次 ${batchLabel}（${batch.length} 个来源）…`);
         addLog(`AI 翻译批次 ${batchLabel}：准备 ${batch.length} 个已有转录来源。`, "AI 翻译");
-        const batchSummary = await translateAiBatchWithRecovery(batch, batchLabel);
+        await options.onBatchStart?.(batch);
+        const batchSummary = await translateAiBatchWithRecovery(batch, batchLabel, true, options.shouldPause);
         summary.translated += batchSummary.translated;
         summary.failed += batchSummary.failed;
         summary.translatedSourceIds.push(...batchSummary.translatedSourceIds);
+        await options.onBatchComplete?.(batch);
         render();
+        if (options.shouldPause?.()) {
+          summary.paused = true;
+          break;
+        }
       }
     } finally {
       restoreSourceSelection(originalSelection, document);
@@ -1724,10 +1903,10 @@ export function bootNotebookApp(): void {
   }
 
   function emptyTranslationSummary() {
-    return { translated: 0, failed: 0, translatedSourceIds: [] as string[] };
+    return { translated: 0, failed: 0, paused: false, translatedSourceIds: [] as string[] };
   }
 
-  async function translateAiBatchWithRecovery(records, batchLabel, allowSplit = true) {
+  async function translateAiBatchWithRecovery(records, batchLabel, allowSplit = true, shouldPause?: () => boolean) {
     const summary = emptyTranslationSummary();
     let pending = records.slice();
     let lastError = "";
@@ -1754,7 +1933,7 @@ export function bootNotebookApp(): void {
         if (!sourcesAreSelected(pending, document)) {
           throw new Error("NotebookLM 未能切换到当前翻译来源，请重试。");
         }
-        const payload = await submitNotebookAiTranslationPrompt();
+        const payload = await submitNotebookAiTranslationPrompt(shouldPause);
         const result = mergeTranslationPayload(payload, pending);
         summary.translated += result.translated.length;
         summary.translatedSourceIds.push(...result.translated.map((record) => record.sourceId).filter(Boolean));
@@ -1766,6 +1945,7 @@ export function bootNotebookApp(): void {
           addLog(`批次 ${batchLabel} 仍缺少 ${pending.length} 条翻译，将仅重试缺少来源。`, "AI 翻译重试");
         }
       } catch (error) {
+        if (error instanceof AiTranslationPauseError) throw error;
         lastError = error && error.message ? error.message : String(error);
         addLog(`批次 ${batchLabel} 第 ${attempt + 1} 次请求失败：${lastError}`, "AI 翻译失败");
         if (error instanceof AiTranslationPageStateError) throw error;
@@ -1778,7 +1958,8 @@ export function bootNotebookApp(): void {
         const child = await translateAiBatchWithRecovery(
           pending.slice(index, index + AI_TRANSLATION_SPLIT_SIZE),
           `${batchLabel}.${Math.floor(index / AI_TRANSLATION_SPLIT_SIZE) + 1}`,
-          false
+          false,
+          shouldPause
         );
         summary.translated += child.translated;
         summary.failed += child.failed;
@@ -1795,10 +1976,12 @@ export function bootNotebookApp(): void {
     return summary;
   }
 
-  async function submitNotebookAiTranslationPrompt() {
+  async function submitNotebookAiTranslationPrompt(shouldPause?: () => boolean) {
+    if (shouldPause?.()) throw new AiTranslationPauseError();
     let input = findChatInput(document, state.root);
     if (!input) {
-      await waitForCondition(() => Boolean(findChatInput(document, state.root)), 30_000, 250);
+      await waitForCondition(() => Boolean(shouldPause?.() || findChatInput(document, state.root)), 30_000, 250);
+      if (shouldPause?.()) throw new AiTranslationPauseError();
       input = findChatInput(document, state.root);
     }
     const chatPanel = findChatPanel(input, document);
@@ -1838,7 +2021,7 @@ export function bootNotebookApp(): void {
         "NotebookLM 未接受翻译提示，AI 翻译队列已暂停；请确认对话框可正常发送后重试。"
       );
     }
-    return waitForNotebookAiJson(chatPanel || document, knownPayloads, knownResponseCount);
+    return waitForNotebookAiJson(chatPanel || document, knownPayloads, knownResponseCount, shouldPause);
   }
 
   async function dispatchNotebookAiPrompt(input, chatPanel, prompt, knownUserMessageCount, knownResponseCount) {
@@ -1868,7 +2051,7 @@ export function bootNotebookApp(): void {
     descriptor.set.call(textarea, value);
   }
 
-  async function waitForNotebookAiJson(chatPanel, knownPayloads, knownResponseCount) {
+  async function waitForNotebookAiJson(chatPanel, knownPayloads, knownResponseCount, shouldPause?: () => boolean) {
     const deadline = Date.now() + AI_TRANSLATION_TIMEOUT_MS;
     let stableRaw = "";
     let stableSince = 0;
@@ -1898,6 +2081,7 @@ export function bootNotebookApp(): void {
           return newest.value;
         }
       }
+      if (shouldPause?.() && !generating && !newest) throw new AiTranslationPauseError();
       await wait(AI_TRANSLATION_POLL_MS);
     }
     if (isNotebookAiGenerating(document, findChatPanel(null, document), state.root)) {
@@ -2134,9 +2318,16 @@ export function bootNotebookApp(): void {
     panelQuery("[data-role='drive-pane']").toggleAttribute("hidden", state.importMode !== "drive");
     panelQuery("[data-role='facebook-pane']").toggleAttribute("hidden", state.importMode !== "facebook");
     const facebookImportButton = panelQuery<HTMLButtonElement>("[data-action='import-facebook']");
-    facebookImportButton.textContent = facebookJob && facebookJob.status !== "completed" && facebookJob.nextIndex > 0
-      ? `继续导入 ${facebookJob.nextIndex}/${facebookJob.tasks.length}`
-      : "开始导入";
+    const pendingFacebookTranslations = facebookJob?.translate
+      ? state.records.filter((record) => record.sourceId && record.transcript && !record.error &&
+        !record.translation && !record.sourceDeleted).length
+      : 0;
+    facebookImportButton.textContent = facebookJob && facebookJob.status !== "completed" &&
+      facebookJob.nextIndex >= facebookJob.tasks.length && pendingFacebookTranslations
+      ? `继续翻译 ${pendingFacebookTranslations}`
+      : facebookJob && facebookJob.status !== "completed" && facebookJob.nextIndex > 0
+        ? `继续导入 ${facebookJob.nextIndex}/${facebookJob.tasks.length}`
+        : "开始导入";
     const batchSizeInput = panelQuery<HTMLInputElement>("[data-role='drive-batch-size']");
     if (batchSizeInput) {
       batchSizeInput.value = String(state.driveBatchSize);

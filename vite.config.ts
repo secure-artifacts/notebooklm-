@@ -13,6 +13,9 @@ export default defineConfig({
   build: {
     sourcemap: false,
     rollupOptions: {
+      input: {
+        driveLoader: resolve(__dirname, "src/scopes/drive-loader/index.html")
+      },
       output: {
         manualChunks: undefined
       }

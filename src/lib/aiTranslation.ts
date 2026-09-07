@@ -29,12 +29,9 @@ export function sourceNamesMatch(left: unknown, right: unknown): boolean {
 
 export function buildTranslationPrompt(): string {
   return [
-    "请将当前选中的全部来源分别完整翻译成中国大陆通用的简体中文。",
-    "不需要研究，仅根据转录原文翻译即可。",
-    "译文必须全部使用简体中文汉字，不得使用繁体中文或繁体字；人名、地名和专有名词也请使用常见的简体中文写法。",
-    "不得概括、删减、合并来源。",
-    "请仅输出合法 JSON 数组，不要使用 Markdown 代码块，不要解释。",
-    "格式必须完全为：",
+    "请将当前选中的所有来源分别根据转录原文完整翻译成中国大陆通用的简体中文。",
+    "输出格式按照合法 JSON 数组，不要解释，不需要深度思考。",
+    "格式为：",
     '[{"source_name":"来源名","zh":"完整简体中文翻译"}]'
   ].join("\n");
 }

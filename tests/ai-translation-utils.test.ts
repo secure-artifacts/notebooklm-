@@ -57,7 +57,8 @@ test("buildTranslationPrompt keeps the strict JSON contract", () => {
   const prompt = utils.buildTranslationPrompt();
   assert.match(prompt, /合法 JSON 数组/);
   assert.match(prompt, /中国大陆通用的简体中文/);
-  assert.match(prompt, /不得使用繁体中文或繁体字/);
+  assert.match(prompt, /根据转录原文完整翻译/);
+  assert.match(prompt, /不需要深度思考/);
   assert.match(prompt, /完整简体中文翻译/);
   assert.match(prompt, /"source_name"/);
   assert.match(prompt, /"zh"/);
