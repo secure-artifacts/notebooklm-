@@ -104,7 +104,9 @@ def _is_facebook_url(value):
     try:
         url = urlparse(str(value))
         host = (url.hostname or "").lower()
-        return url.scheme == "https" and (host == "facebook.com" or host.endswith(".facebook.com") or host == "fb.watch")
+        return url.scheme == "https" and not url.username and not url.password and url.port in (None, 443) and host in (
+            "facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com", "fb.watch", "fb.com", "www.fb.com"
+        )
     except Exception:
         return False
 
@@ -171,7 +173,10 @@ def _download(task, task_dir):
         "progress_hooks": [enforce_size],
     }
     with YoutubeDL(options) as downloader:
-        info = downloader.extract_info(task["url"], download=True)
+        media_url = urlparse(task["url"])
+        if media_url.hostname in ("fb.com", "www.fb.com"):
+            media_url = media_url._replace(netloc="www.facebook.com")
+        info = downloader.extract_info(media_url.geturl(), download=True)
     path = _find_media_file(task_dir)
     if not path:
         raise RuntimeError("下载完成但没有找到媒体文件")

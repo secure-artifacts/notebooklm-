@@ -1,5 +1,6 @@
 import {
   decodeColabControlValue,
+  normalizeFacebookUrl,
   parseColabControlEvents,
   type ColabBridgeEvent,
   type FacebookDownloadTask
@@ -48,6 +49,11 @@ export class FacebookImportCoordinator {
 
   async start(tasks: FacebookDownloadTask[], autoDelete: boolean): Promise<TranscriptRecord[]> {
     if (!tasks.length) return [];
+    tasks = tasks.map((task) => {
+      const url = normalizeFacebookUrl(task.url);
+      if (!url) throw new Error("无效的 Facebook 视频链接。");
+      return { ...task, url };
+    });
     this.cancelled = false;
     const runtimes = new Map(tasks.map((task) => [task.taskId, { input: task } as RuntimeTask]));
     let control: ControlEvent | null = null;

@@ -2,9 +2,15 @@
 
 这是一个本地加载的 Chrome/Edge 扩展：把公开的 Google Drive 音视频批量加入当前 NotebookLM 笔记本，逐个读取来源转录稿，可选通过 NotebookLM AI 翻译为中文，并把结果登记到你的 Google Sheets 数据库服务。
 
-> 当前版本：`v0.13.0` · 发布后下载并解压 Release 中的 ZIP，在浏览器扩展管理页使用「加载已解压的扩展程序」导入。
+> 当前版本：`v0.13.1` · 发布后下载并解压 Release 中的 ZIP，在浏览器扩展管理页使用「加载已解压的扩展程序」导入。
 
 ## 最新更新
+
+### v0.13.1
+
+- 支持 `fb.com`、`www.fb.com` 视频/贴文链接，下载前规范化为 `www.facebook.com`，保留路径和查询参数。
+- 统一前端与 Colab 的 Facebook 域名校验，拒绝伪造域名、含用户凭据及非标准端口的链接。
+- 更新后请重新加载扩展、刷新 NotebookLM，并重新启动 Colab 临时后端；仅 Facebook 首页地址不能指定下载视频。
 
 ### v0.13.0
 

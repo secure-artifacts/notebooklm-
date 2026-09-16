@@ -18,6 +18,7 @@ test("unified rows detect both providers and allow optional ID", () => {
   const state = fixture();
   assert.equal(state.rows[0].provider, "drive"); assert.equal(state.rows[0].displayId, "");
   assert.equal(state.rows[1].provider, "facebook");
+  assert.equal(providerForUrl("https://fb.com/reel/123456789"), "facebook");
   assert.equal(providerForUrl("https://facebook.com.evil.test/reel/123456"), "");
 });
 test("identity locks at processing start and cannot be unlocked by a result", () => {

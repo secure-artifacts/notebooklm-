@@ -76,6 +76,8 @@ const facebookHosts = new Set([
   "www.facebook.com",
   "m.facebook.com",
   "web.facebook.com",
+  "fb.com",
+  "www.fb.com",
   "fb.watch"
 ]);
 
@@ -85,7 +87,8 @@ export function normalizeFacebookUrl(value: string): string {
   const cleaned = value.trim().replace(trailingPunctuation, "");
   try {
     const url = new URL(cleaned);
-    if (url.protocol !== "https:" || !facebookHosts.has(url.hostname.toLowerCase())) return "";
+    if (url.protocol !== "https:" || url.username || url.password || url.port || !facebookHosts.has(url.hostname.toLowerCase())) return "";
+    if (url.hostname === "fb.com" || url.hostname === "www.fb.com") url.hostname = "www.facebook.com";
     url.hash = "";
     return url.toString();
   } catch {
@@ -162,7 +165,7 @@ export function parseFacebookTasks(input: string, maxTasks = 30): FacebookTaskPa
   const tasks: FacebookDownloadTask[] = [];
   const errors: string[] = [];
   const seen = new Set<string>();
-  const urlPattern = /https:\/\/(?:www\.|m\.|web\.)?(?:facebook\.com|fb\.watch)\/[^\s<>"']+/iu;
+  const urlPattern = /https:\/\/[^\s<>"']+/iu;
 
   for (const [index, rawLine] of input.split(/\r?\n/u).entries()) {
     const line = rawLine.trim();

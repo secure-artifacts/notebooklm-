@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildGithubColabUrl,
+  normalizeFacebookUrl,
   buildColabScratchpadUrl,
   classifyColabFailure,
   colabBridgePrefix,
@@ -16,6 +17,13 @@ import {
   parseFacebookClipboardRows,
   shouldAppendFacebookEditorRow
 } from "../src/lib/colabProvider";
+
+test("fb.com aliases preserve video paths and query parameters", () => {
+  assert.equal(normalizeFacebookUrl("https://fb.com/reel/123456789"), "https://www.facebook.com/reel/123456789");
+  assert.equal(normalizeFacebookUrl("https://www.fb.com/watch/?v=123&ref=share#anchor"), "https://www.facebook.com/watch/?v=123&ref=share");
+  assert.equal(parseFacebookTasks(["id https://fb.com/reel/123456789"].join("\n")).tasks[0].url, "https://www.facebook.com/reel/123456789");
+  for (const url of ["https://fb.com.evil.test/123", "https://evil.test/fb.com", "https://fb.com@evil.test/123", "https://user@fb.com/123", "https://fb.com:8443/123", "http://fb.com/123"]) assert.equal(normalizeFacebookUrl(url), "");
+});
 
 test("parseFacebookTasks accepts named and unnamed public links", () => {
   const result = parseFacebookTasks([
