@@ -11,11 +11,15 @@ import { callNotebookPageApi } from "./notebookClient";
 const SESSION_TIMEOUT_MS = 90 * 60 * 1000;
 const NOTEBOOK_PROCESSING_TIMEOUT_MS = 30 * 60 * 1000;
 const POLL_INTERVAL_MS = 1200;
+export class ColabNotStartedError extends Error {}
 
 type CoordinatorHooks = {
+  onBatchAccepted?: () => Promise<void> | void;
+  beforeNotebookRequest?: () => void;
   onStage: (message: string) => void;
   onLog: (message: string, kind: string) => void;
-  onSourcePrepared?: (sourceId: string) => Promise<void> | void;
+  onSourcePrepared?: (sourceId: string, taskId: string, fileName: string) => Promise<void> | void;
+  onRecord?: (taskId: string, record: TranscriptRecord) => Promise<void> | void;
   onTaskStatus?: (taskId: string, status: string, message?: string) => void;
 };
 
@@ -53,7 +57,7 @@ export class FacebookImportCoordinator {
       control = null;
     }
     if (!control) {
-      throw new Error("未启动 Colab 临时后端。请点击浏览器扩展图标，先启动 Colab 临时后端并等待其显示已就绪。");
+      throw new ColabNotStartedError("未启动 Colab 临时后端。请点击浏览器扩展图标启动后端，等待就绪后直接点击开始 / 继续；本批尚未开始。");
     }
     this.hooks.onStage("正在连接 Colab 临时后端…");
     this.hooks.onLog("已连接当前浏览器中的唯一 Colab 临时后端。", "Colab");
@@ -67,6 +71,7 @@ export class FacebookImportCoordinator {
       throw new Error(`Colab 临时后端连接失败，请点击扩展图标重新启动后端。${errorMessage(error)}`);
     }
     if (!accepted?.ok) throw new Error(`Colab 拒绝任务：${String(accepted?.error || "未知原因")}`);
+    await this.hooks.onBatchAccepted?.();
 
     let cursor = Math.max(0, Number(accepted.cursor) || 0);
     let complete = false;
@@ -146,6 +151,7 @@ export class FacebookImportCoordinator {
     const size = Number(event.size);
     this.hooks.onStage(`正在申请上传会话：${runtime.input.postId}`);
     try {
+      this.hooks.beforeNotebookRequest?.();
       const prepared = await callNotebookPageApi("prepare-remote-media-source", {
         fileName,
         type: mimeType,
@@ -154,7 +160,7 @@ export class FacebookImportCoordinator {
       runtime.sourceId = String(prepared.sourceId || "");
       if (!runtime.sourceId) throw new Error("NotebookLM 未返回来源编号。");
       this.pendingSourceIds.add(runtime.sourceId);
-      await this.hooks.onSourcePrepared?.(runtime.sourceId);
+      await this.hooks.onSourcePrepared?.(runtime.sourceId, runtime.input.taskId, fileName);
       runtime.fileName = fileName;
       runtime.mimeType = mimeType;
       runtime.size = size;
@@ -166,9 +172,10 @@ export class FacebookImportCoordinator {
       // Do not retain the signed upload URL in extension state.
       prepared.uploadUrl = "";
     } catch (error) {
-      if (runtime.sourceId) await deleteSourceQuietly(runtime.sourceId);
+      const deleted = runtime.sourceId ? await deleteSourceQuietly(runtime.sourceId) : false;
       if (runtime.sourceId) this.pendingSourceIds.delete(runtime.sourceId);
       runtime.failure = failureRecord(runtime, errorMessage(error));
+      runtime.failure.sourceDeleted = deleted;
       try {
         await this.callControl("provide_upload", [JSON.stringify({
           taskId: runtime.input.taskId,
@@ -187,7 +194,9 @@ export class FacebookImportCoordinator {
     const sourceId = runtime.sourceId;
     runtime.extraction = (async () => {
       this.hooks.onStage(`等待 NotebookLM 转录：${runtime.input.postId}`);
+      let record: TranscriptRecord;
       try {
+        this.hooks.beforeNotebookRequest?.();
         const result = await callNotebookPageApi("extract-existing-sources", {
           sourceIds: [sourceId],
           sourceNames: { [sourceId]: runtime.fileName || runtime.input.postId },
@@ -195,30 +204,32 @@ export class FacebookImportCoordinator {
           timeoutMs: NOTEBOOK_PROCESSING_TIMEOUT_MS,
           overallTimeoutMs: NOTEBOOK_PROCESSING_TIMEOUT_MS
         }, () => undefined, NOTEBOOK_PROCESSING_TIMEOUT_MS + 30_000);
-        const record = Array.isArray(result.records) ? result.records[0] : null;
+        record = Array.isArray(result.records) ? result.records[0] : null;
         if (!record?.transcript || record.error) throw new Error(record?.error || "NotebookLM 未返回转录文字。");
-        if (autoDelete) {
-          await deleteSourceQuietly(sourceId);
-          record.sourceDeleted = true;
-        }
-        this.pendingSourceIds.delete(sourceId);
-        this.hooks.onTaskStatus?.(runtime.input.taskId, "completed");
-        return record as TranscriptRecord;
       } catch (error) {
-        if (autoDelete) await deleteSourceQuietly(sourceId);
-        this.pendingSourceIds.delete(sourceId);
-        this.hooks.onTaskStatus?.(runtime.input.taskId, "failed", errorMessage(error));
-        return failureRecord(runtime, errorMessage(error));
+        record = failureRecord(runtime, errorMessage(error));
       }
+      // Storage failures must propagate, never turn saved text into an empty failure.
+      await this.hooks.onRecord?.(runtime.input.taskId, record);
+      if (autoDelete && record.transcript && !record.error) {
+        this.hooks.beforeNotebookRequest?.();
+        record.sourceDeleted = await deleteSourceQuietly(sourceId);
+      }
+      this.pendingSourceIds.delete(sourceId);
+      this.hooks.onTaskStatus?.(runtime.input.taskId, record.error ? "failed" : "completed", record.error);
+      return record;
     })();
+    // The final Promise.all still receives errors; attach a handler while polling.
+    void runtime.extraction.catch(() => undefined);
   }
 
   private async recordFailure(runtimes: Map<string, RuntimeTask>, event: Extract<ColabBridgeEvent, { type: "task" }>): Promise<void> {
     const runtime = runtimes.get(event.task_id);
     if (!runtime || runtime.failure || runtime.extraction) return;
-    if (runtime.sourceId) await deleteSourceQuietly(runtime.sourceId);
+    const deleted = runtime.sourceId ? await deleteSourceQuietly(runtime.sourceId) : false;
     if (runtime.sourceId) this.pendingSourceIds.delete(runtime.sourceId);
     runtime.failure = failureRecord(runtime, String(event.error || "Colab 任务失败。"));
+    runtime.failure.sourceDeleted = deleted;
     this.hooks.onLog(`${runtime.input.postId}：${runtime.failure.error}`, "Colab 失败");
   }
 
@@ -228,11 +239,13 @@ export class FacebookImportCoordinator {
   }
 }
 
-async function deleteSourceQuietly(sourceId: string): Promise<void> {
+async function deleteSourceQuietly(sourceId: string): Promise<boolean> {
   try {
-    await callNotebookPageApi("delete-sources", { sourceIds: [sourceId] }, () => undefined, 60_000);
+    const result = await callNotebookPageApi("delete-sources", { sourceIds: [sourceId] }, () => undefined, 60_000);
+    return Array.isArray(result.deleted) && result.deleted.includes(sourceId);
   } catch {
     // The caller reports the primary failure; cleanup remains best effort.
+    return false;
   }
 }
 

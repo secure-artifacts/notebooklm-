@@ -27,6 +27,7 @@ import { notebookOrigins } from "@/const";
   };
 
   const bridgeToken = new URLSearchParams(location.hash.slice(1)).get("token") || "";
+  const downloads = new Map<string, AbortController>();
   window.addEventListener("message", handleMessage);
   postReady();
 
@@ -45,17 +46,18 @@ import { notebookOrigins } from "@/const";
     if (event.source !== parent || !notebookOrigins.has(event.origin)) return;
     const message = event.data;
     if (!message || message.source !== APP_ID || message.target !== "drive-loader" || message.token !== bridgeToken) return;
+    if (message.type === "drive-download-cancel") { downloads.get(message.requestId)?.abort(); return; }
     if (message.type !== "drive-download-request") return;
-
-    downloadPublicDriveMedia(message.url, message.requestId, event.origin)
+    const controller = new AbortController(); downloads.set(message.requestId, controller);
+    downloadPublicDriveMedia(message.url, message.requestId, event.origin, controller.signal)
       .then((file) => postResult(event.origin, message.requestId, { ok: true, file, mediaType: file.type, size: file.size }))
       .catch((error) => postResult(event.origin, message.requestId, {
         ok: false,
         error: error && error.message ? error.message : String(error)
-      }));
+      })).finally(() => downloads.delete(message.requestId));
   }
 
-  async function downloadPublicDriveMedia(sharedUrl, requestId, parentOrigin) {
+  async function downloadPublicDriveMedia(sharedUrl, requestId, parentOrigin, signal: AbortSignal) {
     const reference = extractDriveReference(sharedUrl);
     if (!reference) throw new Error("不是有效的 Google Drive 文件链接。");
     const { fileId, resourceKey } = reference;
@@ -67,6 +69,7 @@ import { notebookOrigins } from "@/const";
     if (resourceKey) downloadUrl.searchParams.set("resourcekey", resourceKey);
 
     const response = await fetch(downloadUrl, {
+      signal,
       method: "GET",
       credentials: "omit",
       redirect: "follow",

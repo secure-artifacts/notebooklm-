@@ -149,7 +149,7 @@ def _probe_media(path):
 
 
 def _download(task, task_dir):
-    post_id = _safe_name(task.get("postId"), f"facebook_{task['taskId']}")
+    post_id = _safe_name(task.get("postId"), f"video_{uuid.uuid4().hex[:12]}")
 
     def enforce_size(progress):
         downloaded = int(progress.get("downloaded_bytes") or 0)
@@ -171,12 +171,18 @@ def _download(task, task_dir):
         "progress_hooks": [enforce_size],
     }
     with YoutubeDL(options) as downloader:
-        downloader.extract_info(task["url"], download=True)
+        info = downloader.extract_info(task["url"], download=True)
     path = _find_media_file(task_dir)
     if not path:
         raise RuntimeError("下载完成但没有找到媒体文件")
     if path.stat().st_size > MAX_MEDIA_BYTES:
         raise RuntimeError(f"媒体超过 {MAX_MEDIA_BYTES // (1024 * 1024)} MB 上限")
+    if task.get("autoId"):
+        discovered_id = _safe_name((info or {}).get("id"), post_id)
+        named_path = path.with_name(discovered_id + path.suffix)
+        if named_path != path:
+            path.rename(named_path)
+            path = named_path
     return path, _probe_media(path)
 
 
@@ -260,7 +266,7 @@ def start_batch(tasks_json, token):
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", task_id) or task_id in seen or not _is_facebook_url(item.get("url")):
                 raise gr.Error("Invalid Facebook task payload")
             seen.add(task_id)
-            clean_tasks.append({"taskId": task_id, "postId": _safe_name(item.get("postId"), task_id), "url": item["url"]})
+            clean_tasks.append({"taskId": task_id, "postId": _safe_name(item.get("postId"), task_id), "url": item["url"], "autoId": bool(item.get("autoId"))})
         task_ids = tuple(item["taskId"] for item in clean_tasks)
         if _batch_running:
             if task_ids == _started_task_ids:

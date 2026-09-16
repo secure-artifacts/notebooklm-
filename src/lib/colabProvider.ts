@@ -49,6 +49,7 @@ export type FacebookDownloadTask = {
   taskId: string;
   postId: string;
   url: string;
+  autoId?: boolean;
 };
 
 export type FacebookTaskParseResult = {

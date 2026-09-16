@@ -12,13 +12,14 @@ import type {
 } from "@/types/messages";
 import type { FacebookBulkJob, FacebookJobProgress } from "@/types/facebookJob";
 import { useStorageLocal } from "@webextkits/storage-local";
+import type { Workspace, WorkspaceCommand, WorkspaceChange } from "@/lib/recordWorkspace";
 
 const storage = useStorageLocal<SchemaType>(schema);
 const runtimeChannel = "nlm-transcript-background";
 
 type RuntimeResponse = { ok: true; result: unknown } | { ok: false; error: string };
 
-type BackgroundAction = "upsertSheet" | "callColab" | "getColabSessionEvent" | "findReusableColabRuntime" |
+type BackgroundAction = "loadWorkspace" | "changeWorkspace" | "upsertSheet" | "callColab" | "getColabSessionEvent" | "findReusableColabRuntime" |
   "loadFacebookJob" | "saveFacebookJob" | "updateFacebookJobProgress" | "updateFacebookJobActiveSources" | "clearFacebookJob";
 
 function sendBackground(action: BackgroundAction, payload: unknown): Promise<unknown> {
@@ -35,6 +36,12 @@ function sendBackground(action: BackgroundAction, payload: unknown): Promise<unk
 }
 
 export const extensionClient = {
+  loadWorkspace(notebookId: string): Promise<Workspace> {
+    return sendBackground("loadWorkspace", { notebookId }) as Promise<Workspace>;
+  },
+  changeWorkspace(notebookId: string, revision: number, command: WorkspaceCommand): Promise<WorkspaceChange> {
+    return sendBackground("changeWorkspace", { notebookId, revision, command }) as Promise<WorkspaceChange>;
+  },
   async getSettings(): Promise<InjectSettings> {
     const [panel, sheet] = await Promise.all([
       storage.getBucket(panelSettingsStorageKey, { autoFillDefault: true }),
