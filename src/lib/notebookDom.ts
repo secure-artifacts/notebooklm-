@@ -117,7 +117,7 @@ export function isNotebookAiGenerating(
   chatPanel: Element | null,
   panelRoot: Element | null
 ): boolean {
-  const scopes: ParentNode[] = chatPanel ? [chatPanel, doc] : [doc];
+  const scopes: ParentNode[] = chatPanel ? [chatPanel] : [doc];
   for (const scope of scopes) {
     const controls = Array.from(scope.querySelectorAll<HTMLButtonElement>("button"));
     const stopButton = controls.find((button) => {
@@ -167,6 +167,19 @@ export function getAiResponseTexts(responseRoot: ParentNode): string[] {
       return String(clone.textContent || "").trim();
     })
     .filter(Boolean);
+}
+
+export function getTranslationTurns(root: ParentNode): import("./translationTurn").ChatTurn[] {
+  return Array.from(root.querySelectorAll(".from-user-message-inner-content, .to-user-message-inner-content"))
+    .map(message => {
+      const clone = (message.querySelector(".message-text-content") || message).cloneNode(true) as Element;
+      clone.querySelectorAll(".citation-marker, thinking-chain-view, .thinking-chain").forEach(el => el.remove());
+      const card = message.closest(".to-user-message-card-content");
+      const complete = Boolean(card && Array.from(card.querySelectorAll("button")).some(button =>
+        /^(copy_all|thumb_up|thumb_down)$/.test(String(button.textContent || "").trim()) && isUsableControl(button, message.ownerDocument)));
+      return { role: message.classList.contains("from-user-message-inner-content") ? "user" as const : "assistant" as const,
+        text: String(clone.textContent || "").trim(), complete };
+    });
 }
 
 export function getUserMessageTexts(responseRoot: ParentNode): string[] {

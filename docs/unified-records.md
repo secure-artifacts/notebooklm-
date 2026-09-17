@@ -51,6 +51,15 @@ the current operation, then starts no further registration/removal requests.
 
 ## Modules
 
+AI translation requests now persist a unique marker and prompt on each pending
+row before submission. Replies are attributed to that user turn, never deduped
+by translated text. Resume first reads the associated reply; ambiguous or missing
+turns fail closed without deleting sources. Live DOM is re-queried on each poll.
+Thinking/citation nodes are excluded. Completion requires stable text, no active
+generation, and an available chat input or response action controls. Invalid
+finished JSON reports an explicit error rather than waiting for the global timeout.
+Old rows without a request marker require one new explicit translation attempt.
+
 - lib/recordWorkspace: row schema, command reducer, validation, migration, TSV
 - background/recordWorkspaceStore: IndexedDB transactions and queue lease
 - content/workspaceClient: versioned serialized commands

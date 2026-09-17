@@ -7,6 +7,7 @@ import { stripSourceSuffix } from "./aiTranslation";
 export const MAX_ROWS = 1000;
 export type RowRequirements = { translate: boolean; autoRegister: boolean; databaseUrl: string; autoDelete: boolean };
 export type RecordRow = TranscriptRecord & {
+  translationRequest?: import("./translationTurn").TranslationRequest;
   rowId: string; displayId: string; url: string;
   provider: "drive" | "facebook" | "existing" | "";
   locked: boolean; phase: "pending" | "working" | "done" | "failed";

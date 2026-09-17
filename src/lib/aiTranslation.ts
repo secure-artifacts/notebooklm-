@@ -66,7 +66,9 @@ export function extractJsonArrayCandidates(text: unknown): Array<{ raw: string; 
         if (!depth) {
           const raw = source.slice(start, index + 1);
           try {
-            const value = JSON.parse(raw);
+            let value: unknown;
+            try { value = JSON.parse(raw); }
+            catch { value = JSON.parse(raw.replace(/"source\\_name"\s*:/g, '"source_name":')); }
             if (Array.isArray(value)) candidates.push({ raw, value });
           } catch {
             // Streaming responses can be incomplete until the final update.
@@ -90,6 +92,9 @@ export function mergeTranslationPayload(payload: unknown, records: TranscriptRec
       unknown.push(item);
       return;
     }
+    const duplicate = (Array.isArray(payload) ? payload : []).filter((other) =>
+      other && sourceNamesMatch(other.source_name, candidate.source_name)).length > 1;
+    if (duplicate) { unknown.push(item); return; }
     const index = unmatchedRecords.findIndex((record) =>
       sourceNamesMatch(candidate.source_name, record.sourceOriginalName || record.sourceName));
     if (index < 0) {

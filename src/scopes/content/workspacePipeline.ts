@@ -171,7 +171,10 @@ export class WorkspacePipeline {
         this.report(`正在翻译 ${start + 1}–${start + batch.length}/${pending.length} 条`);
         try {
           const result = await this.translate(batch.map((id) => this.store.row(id)), this.panel, () => this.paused,
-            async (id, translation) => { await this.patch(id, { translation, translationPhase: "done", translationError: "" }); });
+            async (id, translation) => { await this.patch(id, { translation, translationPhase: "done", translationError: "" }); }, {
+              stage: (text) => this.report(text),
+              request: async (ids, request) => { for (const id of ids) await this.patch(id, { translationRequest: request }); }
+            });
           for (const id of batch) await this.patch(id, result.has(id)
             ? { translation: result.get(id), translationPhase: "done", translationError: "" }
             : this.paused ? { translationPhase: "pending", translationError: "" }
