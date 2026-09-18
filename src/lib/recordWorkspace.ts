@@ -7,6 +7,7 @@ import { stripSourceSuffix } from "./aiTranslation";
 export const MAX_ROWS = 1000;
 export type RowRequirements = { translate: boolean; autoRegister: boolean; databaseUrl: string; autoDelete: boolean };
 export type RecordRow = TranscriptRecord & {
+  creationUnconfirmed?:boolean;
   translationRequest?: import("./translationTurn").TranslationRequest;
   rowId: string; displayId: string; url: string;
   provider: "drive" | "facebook" | "existing" | "";
@@ -17,7 +18,7 @@ export type RecordRow = TranscriptRecord & {
 };
 export type Workspace = {
   version: 1; notebookId: string; revision: number; rows: RecordRow[]; widths: number[];
-  lease?: { tabId: number; until: number };
+  lease?: { tabId: number; until: number; runId?:string };
 };
 export type WorkspaceChange = Pick<Workspace, "revision" | "widths" | "lease"> & { upserts: RecordRow[]; deleted: string[] };
 export function mergeWorkspaceChange(state: Workspace, change: WorkspaceChange): Workspace {
@@ -30,10 +31,10 @@ export function mergeWorkspaceChange(state: Workspace, change: WorkspaceChange):
 export type WorkspaceCommand =
   | { type: "add"; rows: RecordRow[] }
   | { type: "edit"; cells: { rowId: string; field: "displayId" | "url"; value: string }[]; additions?: RecordRow[] }
-  | { type: "result"; rowId: string; patch: Partial<RecordRow>; automaticId?: string }
+  | { type: "result"; rowId: string; patch: Partial<RecordRow>; automaticId?: string; runId?:string }
   | { type: "delete"; rowIds: string[] }
   | { type: "widths"; widths: number[] }
-  | { type: "claim" | "release" | "heartbeat" };
+  | { type: "claim" | "release" | "heartbeat"; runId?:string };
 export function providerForUrl(value: string): RecordRow["provider"] {
   return extractDriveFileId(value) ? "drive" : normalizeFacebookUrl(value) ? "facebook" : "";
 }
@@ -64,9 +65,13 @@ export function needsMedia(row: RecordRow): boolean {
   return !row.transcript || Boolean(row.error) || Boolean(requirementsFor(row).translate && !row.translation && (!row.sourceId || row.sourceDeleted));
 }
 export function shouldContinue(row: RecordRow): boolean {
+  if (isEmptyDraft(row)) return false;
   if (row.taskDone) return false;
   if (!row.requirements && taskComplete(row)) return false;
   return row.phase !== "failed" && row.translationPhase !== "failed" && !row.registrationError;
+}
+export function isEmptyDraft(row: RecordRow): boolean {
+  return !row.locked && !row.displayId.trim() && !row.url.trim() && !row.sourceId && !row.transcript && !row.translation && !row.translationRequest;
 }
 export function isUnstartedColabFailure(row: RecordRow): boolean {
   return row.provider === "facebook" && row.phase === "failed" && !row.sourceId && !row.transcript && !row.translation
@@ -78,6 +83,7 @@ export function retryRequirements(row: RecordRow, current: RowRequirements): Row
     databaseUrl: current.autoRegister ? current.databaseUrl : previous.databaseUrl || current.databaseUrl };
 }
 export function rowIssue(row: RecordRow): string {
+  if(row.creationUnconfirmed && !row.sourceId)return "上次来源创建结果未确认。请先核对 NotebookLM 来源，不能直接重传以免重复创建。";
   if (row.provider === "existing") return "";
   return !row.url.trim() ? "请填写视频链接" : !providerForUrl(row.url) ? "仅支持公开的 Google Drive / Facebook HTTPS 链接" : "";
 }
@@ -88,7 +94,9 @@ export function applyWorkspaceCommand(state: Workspace, command: WorkspaceComman
   const next = structuredClone(state);
   if (next.lease && next.lease.until <= now) delete next.lease;
   if (next.lease && next.lease.tabId !== tabId) throw new Error("此笔记本正在另一个标签页处理，请先在该标签页暂停。");
-  if (command.type === "claim") next.lease = { tabId, until: now + 90_000 };
+  if ("runId" in command && command.runId && command.type!=="claim" && next.lease?.runId!==command.runId) throw new Error("旧任务结果已失效，未写入记录。");
+  if(command.type==="result" && next.lease?.runId && command.runId!==next.lease.runId)throw new Error("结果缺少当前任务编号。");
+  if (command.type === "claim") next.lease = { tabId, until: now + 90_000, runId:command.runId };
   else if (command.type === "heartbeat") {
     if (next.lease?.tabId !== tabId) throw new Error("队列运行权已失效，请刷新后继续。");
     next.lease.until = now + 90_000;

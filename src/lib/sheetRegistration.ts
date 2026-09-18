@@ -116,6 +116,18 @@ type ServiceResult = {
   };
 };
 
+export function confirmedSheetOutcomes(result: ServiceResult | null | undefined, records: SheetRecord[]): boolean[] {
+  const outcomes = result?.data?.results;
+  if (result?.ok !== true || !Array.isArray(outcomes)) return records.map(()=>false);
+  return records.map((record,index)=>{
+    const matches=outcomes.filter(o=>o && (o.post_id===record.post_id || o.index===index));
+    if(matches.length!==1)return false;
+    const o=matches[0];
+    return o.success===true && (o.post_id===undefined || o.post_id===record.post_id) &&
+      (o.index===undefined || o.index===index);
+  });
+}
+
 export function analyzeBatchResponse(
   result: ServiceResult | null | undefined,
   batchRecords: SheetRecord[],

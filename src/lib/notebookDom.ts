@@ -8,17 +8,19 @@ export function getSourceControls(doc: Document): SourceControl[] {
       const button = container.querySelector<HTMLButtonElement>("button.source-stretched-button[aria-label]");
       const checkbox = container.querySelector<HTMLInputElement>('input[type="checkbox"]');
       return {
+        sourceId: container.querySelector('[id^="source-item-more-button-"]')?.id?.slice("source-item-more-button-".length),
         container,
         button,
         checkbox,
         name: button ? String(button.getAttribute("aria-label") || "").trim() : ""
       };
     })
-    .filter((item): item is SourceControl => Boolean(item.name && item.checkbox));
+    .filter((item): item is SourceControl & {sourceId:string|undefined} => Boolean(item.name && item.checkbox));
 }
 
 export function captureSourceSelection(doc: Document): SourceSelection[] {
   return getSourceControls(doc).map((control) => ({
+    sourceId: control.sourceId,
     name: control.name,
     checked: control.checkbox.checked
   }));
@@ -26,10 +28,11 @@ export function captureSourceSelection(doc: Document): SourceSelection[] {
 
 export function restoreSourceSelection(snapshot: SourceSelection[], doc: Document): void {
   if (!Array.isArray(snapshot)) return;
-  const desiredByName = new Map(snapshot.map((item) => [item.name, Boolean(item.checked)]));
+  const desiredByName = new Map(snapshot.map((item) => [item.sourceId || item.name, Boolean(item.checked)]));
   getSourceControls(doc).forEach((control) => {
-    if (!desiredByName.has(control.name)) return;
-    const desired = desiredByName.get(control.name);
+    const key = control.sourceId || control.name;
+    if (!desiredByName.has(key)) return;
+    const desired = desiredByName.get(key);
     if (control.checkbox.checked !== desired) control.checkbox.click();
   });
 }
@@ -44,8 +47,9 @@ export function selectSourcesForRecords(
   const selected: TranscriptRecord[] = [];
   const missing: TranscriptRecord[] = [];
   records.forEach((record) => {
-    const matchIndex = available.findIndex((control) =>
+    const matches = available.filter((control) => record.sourceId ? control.sourceId === record.sourceId :
       namesMatch(control.name, record.sourceOriginalName || record.sourceName));
+    const matchIndex = matches.length === 1 ? available.indexOf(matches[0]) : -1;
     if (matchIndex < 0) {
       missing.push(record);
       return;
@@ -53,11 +57,12 @@ export function selectSourcesForRecords(
     const [control] = available.splice(matchIndex, 1);
     selected.push(record);
     record._aiSourceControlName = control.name;
+    record.sourceName = record.sourceOriginalName = control.name;
   });
 
-  const targetNames = new Set(selected.map((record) => record._aiSourceControlName));
+  const targetNames = new Set(selected.map((record) => record.sourceId || record._aiSourceControlName));
   controls.forEach((control) => {
-    const shouldSelect = targetNames.has(control.name);
+    const shouldSelect = targetNames.has(control.sourceId || control.name);
     if (control.checkbox.checked !== shouldSelect) control.checkbox.click();
   });
   return { selected, missing };
@@ -77,7 +82,7 @@ export async function selectSourcesForRecordsWhenReady(
   const delayMs = Math.max(100, Math.min(3000, Math.floor(options.delayMs || 750)));
   const wait = options.wait || ((duration: number) => new Promise<void>((resolve) => setTimeout(resolve, duration)));
   let result = selectSourcesForRecords(records, namesMatch, doc);
-  for (let attempt = 1; result.missing.length && attempt < attempts; attempt += 1) {
+  for (let attempt = 1; (result.missing.length || !sourcesAreSelected(records, doc)) && attempt < attempts; attempt += 1) {
     await wait(delayMs);
     result = selectSourcesForRecords(records, namesMatch, doc);
   }
@@ -85,9 +90,11 @@ export async function selectSourcesForRecordsWhenReady(
 }
 
 export function sourcesAreSelected(records: TranscriptRecord[], doc: Document): boolean {
-  const selectedNames = new Set(records.map((record) => record._aiSourceControlName));
-  return selectedNames.size === records.length && getSourceControls(doc).every((control) =>
-    control.checkbox.checked === selectedNames.has(control.name));
+  const selectedNames = new Set(records.map((record) => record.sourceId || record._aiSourceControlName));
+  const controls = getSourceControls(doc);
+  return selectedNames.size === records.length && !selectedNames.has(undefined) &&
+    controls.filter(c => c.checkbox.checked).length === records.length && controls.every((control) =>
+    control.checkbox.checked === selectedNames.has(control.sourceId || control.name));
 }
 
 export function findChatInput(doc: Document, panelRoot: Element | null): HTMLTextAreaElement | null {

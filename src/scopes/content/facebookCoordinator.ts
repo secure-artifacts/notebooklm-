@@ -15,6 +15,7 @@ const POLL_INTERVAL_MS = 1200;
 export class ColabNotStartedError extends Error {}
 
 type CoordinatorHooks = {
+  onBatchSubmitting?:()=>Promise<void>;
   onBatchAccepted?: () => Promise<void> | void;
   beforeNotebookRequest?: () => void;
   onStage: (message: string) => void;
@@ -71,6 +72,7 @@ export class FacebookImportCoordinator {
     this.token = control.token;
 
     let accepted: any;
+    await this.hooks.onBatchSubmitting?.();
     try {
       accepted = decodeColabControlValue(await this.callControl("start_batch", [JSON.stringify(tasks)]));
     } catch (error) {
@@ -83,11 +85,10 @@ export class FacebookImportCoordinator {
     let complete = false;
     let pollFailures = 0;
     const deadline = Date.now() + SESSION_TIMEOUT_MS;
+    try {
     while (!complete && !this.cancelled && Date.now() < deadline) {
       try {
         const events = parseColabControlEvents(await this.callControl("poll_events", [cursor]));
-        pollFailures = 0;
-        for (const event of events) cursor = Math.max(cursor, Number((event as any).sequence) || 0);
         if (this.cancelled) break;
 
         for (const event of events) {
@@ -112,6 +113,8 @@ export class FacebookImportCoordinator {
             throw new Error(event.message);
           }
         }
+        for (const event of events) cursor = Math.max(cursor, Number((event as any).sequence) || 0);
+        pollFailures = 0;
       } catch (error) {
         pollFailures += 1;
         if (pollFailures >= 3) throw error;
@@ -129,6 +132,11 @@ export class FacebookImportCoordinator {
     }));
     this.dispose();
     return records;
+    } finally {
+      // Never release the workspace while detached extraction callbacks can still write.
+      await Promise.allSettled(Array.from(runtimes.values()).flatMap(r=>r.extraction?[r.extraction]:[]));
+      this.dispose();
+    }
   }
 
   async cancel(): Promise<void> {
@@ -210,7 +218,8 @@ export class FacebookImportCoordinator {
           timeoutMs: NOTEBOOK_PROCESSING_TIMEOUT_MS,
           overallTimeoutMs: NOTEBOOK_PROCESSING_TIMEOUT_MS
         }, () => undefined, NOTEBOOK_PROCESSING_TIMEOUT_MS + 30_000);
-        record = Array.isArray(result.records) ? result.records[0] : null;
+        const matches = Array.isArray(result.records) ? result.records.filter(r=>r.sourceId===sourceId) : [];
+        record = matches.length===1 ? matches[0] : null;
         if (!record?.transcript || record.error) throw new Error(record?.error || "NotebookLM 未返回转录文字。");
       } catch (error) {
         record = failureRecord(runtime, errorMessage(error));

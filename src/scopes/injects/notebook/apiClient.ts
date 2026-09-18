@@ -710,11 +710,13 @@ export async function callNotebookApi(
   }
 
   function extractVisibleSourceNames() {
-    const blacklist = new Set(["More", "Select all", "Add sources", "Collapse source panel"]);
-    return Array.from(document.querySelectorAll("button"))
-      .map((button) => (button.getAttribute("aria-label") || button.textContent || "").trim())
-      .filter((name) => name && !blacklist.has(name))
-      .filter((name) => /(?:https?;|https?:\/\/|www\.|\.(?:mp3|mp4|m4a|wav|pdf|docx?|txt|csv|pptx?|xlsx?))$/i.test(name));
+    const names: Record<string,string> = {};
+    for (const container of document.querySelectorAll(".single-source-container")) {
+      const id = container.querySelector('[id^="source-item-more-button-"]')?.id.slice("source-item-more-button-".length);
+      const name = container.querySelector("button.source-stretched-button")?.getAttribute("aria-label")?.trim();
+      if (id && name) names[id] = name;
+    }
+    return names;
   }
 
   function findVisibleSourceFailure(sourceName) {

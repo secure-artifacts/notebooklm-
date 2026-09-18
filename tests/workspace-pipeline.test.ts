@@ -26,6 +26,17 @@ test("retry does not trust an old receipt after a later registration failure", a
   assert.ok(calls.includes("delete-sources"));
 });
 const options: PipelineOptions = { translate: true, autoDelete: true, autoRegister: false, databaseUrl: urlA, batchSize: 10, translationBatch: 5 };
+test("cleared draft rows do not block a remaining valid import",async()=>{
+ const {p,store,calls}=setup([newRow(),fb()]);await p.run(options);
+ assert.ok(calls.includes("facebook:new"));assert.equal(store.row('new').taskDone,true);
+});
+test("conflicting sheet receipts never permit automatic deletion",async()=>{
+ const row={...oldDrive(),sourceDeleted:false,translation:'中文',requirements:{...options,autoRegister:true}};
+ const {p,store,calls}=setup([row]);const original=extensionClient.upsertSheet;
+ extensionClient.upsertSheet=async()=>({ok:true,data:{summary:{success:1,failed:0},results:[{index:0,post_id:'other',success:true}]}});
+ try{await p.run(options);}finally{extensionClient.upsertSheet=original;}
+ assert.ok(store.row('old').registrationError);assert.ok(!calls.includes('delete-sources'));
+});
 function setup(rows: RecordRow[]) {
   Object.assign(globalThis, { window: { setInterval, clearInterval }, location: { pathname: "/notebook/test" } });
   const store: any = { notebookId: "test", state: { ...emptyWorkspace("test"), rows }, row(id: string) { return this.state.rows.find((r) => r.rowId === id); },
@@ -41,11 +52,11 @@ function setup(rows: RecordRow[]) {
   };
   p.facebook = async (ids: string[]) => {
     calls.push(`facebook:${ids.join(",")}`);
-    for (const id of ids) await store.command({ type: "result", rowId: id, patch: { transcript: store.row(id).transcript || "new original", sourceId: `source-${id}`, sourceDeleted: false, phase: "done", error: "" } });
+    for (const id of ids) await p.patch(id, { transcript: store.row(id).transcript || "new original", sourceId: `source-${id}`, sourceDeleted: false, phase: "done", error: "" });
   };
   p.driveRow = async (id: string) => {
     calls.push(`drive:${id}`);
-    await store.command({ type: "result", rowId: id, patch: { transcript: store.row(id).transcript || "drive original", sourceId: `source-${id}`, sourceDeleted: false, phase: "done", error: "" } });
+    await p.patch(id, { transcript: store.row(id).transcript || "drive original", sourceId: `source-${id}`, sourceDeleted: false, phase: "done", error: "" });
   };
   p.translate = async (records, _panel, _paused, checkpoint) => {
     calls.push(`translate:${records.map((r) => r.rowId).join(",")}`);
@@ -146,6 +157,7 @@ test("sequential Drive then Facebook respects independent task snapshots", async
 });
 test("failed reimport preserves the previous original text", async () => {
   const { p, store } = setup([oldDrive()]);
+  await store.command({type:"result",rowId:"old",patch:{sourceId:"replacement"}});
   await p.extracted("old", { sourceId: "replacement", sourceName: "old.mp4", transcript: "", error: "download failed" });
   assert.equal(store.row("old").transcript, "保留原文"); assert.equal(taskComplete(store.row("old")), false);
 });

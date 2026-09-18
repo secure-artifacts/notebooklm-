@@ -1,17 +1,22 @@
 import { buildTranslationPrompt, sourceNamesMatch, mergeTranslationPayload } from "@/lib/aiTranslation";
 import { captureSourceSelection, restoreSourceSelection, selectSourcesForRecordsWhenReady, sourcesAreSelected,
-  findChatInput, findChatPanel, findChatSubmit, getTranslationTurns, isNotebookAiGenerating } from "@/lib/notebookDom";
+  findChatInput, findChatPanel, findChatSubmit, getTranslationTurns, isNotebookAiGenerating, getSourceControls } from "@/lib/notebookDom";
 import { locateTranslationReply, TranslationReplyTracker, type TranslationRequest } from "@/lib/translationTurn";
 import type { RecordRow } from "@/lib/recordWorkspace";
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 export class TranslationPaused extends Error {}
-type Hooks = { stage?: (text: string) => void; request?: (ids: string[], request?: TranslationRequest) => Promise<void> };
+type Hooks = { stage?: (text: string) => void; request?: (ids: string[], request?: TranslationRequest) => Promise<void>; binding?:(row:RecordRow)=>Promise<void> };
 export async function translateBatch(rows: RecordRow[], panel: HTMLElement, paused: () => boolean,
   checkpoint: (rowId: string, text: string) => Promise<void>, hooks: Hooks = {}): Promise<Map<string, string>> {
   const snapshot = captureSourceSelection(document), result = new Map<string, string>();
   const groups = new Map<string, RecordRow[]>();
   for (const row of structuredClone(rows)) {
-    const key = row.translationRequest?.id || "new";
+    const live = getSourceControls(document).filter(c=>c.sourceId===row.sourceId);
+    if (!row.translationRequest && live.length===1) row.sourceName=row.sourceOriginalName=live[0].name;
+    const saved=row.translationRequest?.sources?.find(s=>s.rowId===row.rowId&&s.sourceId===row.sourceId);
+    if(saved)row.sourceName=row.sourceOriginalName=saved.name;
+    const duplicate=getSourceControls(document).filter(c=>sourceNamesMatch(c.name,row.sourceOriginalName||row.sourceName)).length>1;
+    const key = row.translationRequest?.id || (duplicate ? row.rowId : "new");
     groups.set(key, [...(groups.get(key) || []), row]);
   }
   try {
@@ -24,9 +29,12 @@ export async function translateBatch(rows: RecordRow[], panel: HTMLElement, paus
           hooks.stage?.("等待对话就绪");
           const selection = await selectSourcesForRecordsWhenReady(pending, sourceNamesMatch, document);
           if (selection.missing.length || !sourcesAreSelected(pending, document)) throw new Error("未能确认当前翻译来源，来源已保留，请检查后重试。");
-          request = await send(panel, paused, async r => {
+          for(const row of pending)await hooks.binding?.(row);
+          try { request = await send(panel, paused, async r => {
             await hooks.request?.(pending.map(row => row.rowId), r);
-          }, hooks);
+          }, hooks, pending); } catch(error) {
+            await hooks.request?.(pending.map(row=>row.rowId)); throw error;
+          }
         } else hooks.stage?.("正在恢复上次翻译回复");
         let payload: unknown[];
         try { payload = await receive(request, panel, paused, hooks); }
@@ -50,7 +58,7 @@ export async function translateBatch(rows: RecordRow[], panel: HTMLElement, paus
   } finally { restoreSourceSelection(snapshot, document); }
 }
 class InvalidTranslationReply extends Error {}
-async function send(panel: HTMLElement, paused: () => boolean, persist: (r: TranslationRequest) => Promise<void>, hooks: Hooks) {
+async function send(panel: HTMLElement, paused: () => boolean, persist: (r: TranslationRequest) => Promise<void>, hooks: Hooks, rows:RecordRow[]) {
   const deadline = Date.now() + 30000;
   let input = findChatInput(document, panel);
   while ((!input || isNotebookAiGenerating(document, findChatPanel(input, document), panel)) && Date.now() < deadline) {
@@ -59,7 +67,7 @@ async function send(panel: HTMLElement, paused: () => boolean, persist: (r: Tran
   }
   if (!input || isNotebookAiGenerating(document, findChatPanel(input, document), panel)) throw new Error("NotebookLM 对话尚未就绪或仍在生成回答，队列已暂停。");
   const id = crypto.randomUUID();
-  const request = { id, createdAt: Date.now(), prompt: buildTranslationPrompt() + "\n本次请求标记：[NLM:" + id + "]（仅用于区分请求，不要输出标记）。" };
+  const request = { id, createdAt: Date.now(), sources:rows.map(r=>({rowId:r.rowId,sourceId:r.sourceId,name:r.sourceOriginalName||r.sourceName})), prompt: buildTranslationPrompt() + "\n本次请求标记：[NLM:" + id + "]（仅用于区分请求，不要输出标记）。" };
   hooks.stage?.("正在发送翻译提示");
   Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(input, request.prompt);
   input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: request.prompt }));
@@ -71,7 +79,10 @@ async function send(panel: HTMLElement, paused: () => boolean, persist: (r: Tran
   }
   if (!button || button.disabled) throw new Error("翻译提示无法发送，队列已暂停。");
   if (paused()) throw new TranslationPaused("已暂停翻译");
-  await persist(request); button.click(); return request;
+  if(!sourcesAreSelected(rows,document))throw new Error("发送前来源选择已改变，已停止发送，来源保留。");
+  await persist(request);
+  if(paused()||!sourcesAreSelected(rows,document))throw new TranslationPaused("发送前已暂停或来源选择发生变化，请核对后继续。");
+  button.click(); return request;
 }
 async function receive(request: TranslationRequest, panel: HTMLElement, paused: () => boolean, hooks: Hooks): Promise<unknown[]> {
   const started = Date.now(), deadline = started + 15 * 60000, tracker = new TranslationReplyTracker();

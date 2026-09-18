@@ -13,6 +13,7 @@ export type TranscriptRecord = {
 };
 
 export type SourceControl = {
+  sourceId?: string;
   container: Element;
   button: HTMLButtonElement | null;
   checkbox: HTMLInputElement;
@@ -20,6 +21,7 @@ export type SourceControl = {
 };
 
 export type SourceSelection = {
+  sourceId?: string;
   name: string;
   checked: boolean;
 };

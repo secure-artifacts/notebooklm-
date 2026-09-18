@@ -1,6 +1,6 @@
 import { newRow, rowComplete, rowIssue, registrationKey, requirementsFor, retryRequirements, needsMedia, shouldContinue, taskComplete, sheetTarget, isUnstartedColabFailure, type RecordRow } from "@/lib/recordWorkspace";
 import { stripSourceSuffix } from "@/lib/aiTranslation";
-import { chunkSheetRegistrationRecords, analyzeBatchResponse, isSheetRequestTooLarge, validDatabaseUrl, validDeploymentUrl } from "@/lib/sheetRegistration";
+import { chunkSheetRegistrationRecords, confirmedSheetOutcomes, isSheetRequestTooLarge, validDatabaseUrl, validDeploymentUrl } from "@/lib/sheetRegistration";
 import { mapConcurrent, formatBytes } from "@/lib/driveImport";
 import { WorkspaceClient } from "./workspaceClient";
 import { DriveDownloadClient } from "./driveDownloadClient";
@@ -16,6 +16,7 @@ export class WorkspacePipeline {
   busy = false; paused = false;
   private drive = new DriveDownloadClient();
   private heartbeat = 0;
+  private runId?:string;
   private translate = translateBatch;
   constructor(readonly store: WorkspaceClient, readonly panel: HTMLElement,
     readonly report: (message: string, error?: boolean) => void, readonly render: () => void) {}
@@ -24,7 +25,7 @@ export class WorkspacePipeline {
     if (location.pathname.replace(/\/$/, "") !== `/notebook/${this.store.notebookId}`) throw new Error("已切换笔记本，任务已暂停；请回到原笔记本继续。");
   }
   private patch(id: string, patch: Partial<RecordRow>, automaticId?: string) {
-    return this.store.command({ type: "result", rowId: id, patch, automaticId });
+    return this.store.command({ type: "result", rowId: id, patch, automaticId, runId:this.runId });
   }
   private async api(action, payload = {}, timeout = 1_800_000): Promise<any> {
     this.guard(); return callNotebookPageApi(action, payload, () => undefined, timeout);
@@ -34,15 +35,17 @@ export class WorkspacePipeline {
     this.busy = true; this.paused = false; this.render();
     let claimed = false;
     try {
-    this.guard(); await this.store.command({ type: "claim" }); claimed = true;
+    this.runId=crypto.randomUUID();
+    this.guard(); await this.store.command({ type: "claim",runId:this.runId }); claimed = true;
     this.heartbeat = window.setInterval(() => {
-      void this.store.command({ type: "heartbeat" }).catch((error) => { this.paused = true; this.report(error.message, true); });
+      void this.store.command({ type: "heartbeat",runId:this.runId }).catch((error) => { this.paused = true; this.report(error.message, true); });
     }, 25_000);
     await work(); this.report(this.paused ? "已暂停，记录已保存。点击继续可恢复。" : "处理完成，记录已保存。"); }
     catch (error) { this.paused = true; this.report(error.message || String(error), !(error instanceof TranslationPaused)); }
     finally {
       clearInterval(this.heartbeat);
-      try { if (claimed) await this.store.command({ type: "release" }); } catch (error) { this.report(`释放队列失败：${error.message}`, true); }
+      try { if (claimed) await this.store.command({ type: "release",runId:this.runId }); } catch (error) { this.report(`释放队列失败：${error.message}`, true); }
+      this.runId=undefined;
       this.busy = false; this.render();
     }
   }
@@ -103,7 +106,9 @@ export class WorkspacePipeline {
     });
   }
   private async extracted(id: string, record: TranscriptRecord) {
-    await this.patch(id, { sourceId: record.sourceId || this.store.row(id).sourceId,
+    const expected=this.store.row(id).sourceId;
+    if(expected && record.sourceId!==expected)throw new Error("转录返回的来源编号不匹配，已拒绝写入。");
+    await this.patch(id, { sourceId: record.sourceId || this.store.row(id).sourceId, creationUnconfirmed:false,
       sourceName: record.sourceName || this.store.row(id).sourceName,
       sourceOriginalName: record.sourceOriginalName || record.sourceName || this.store.row(id).sourceOriginalName,
       transcript: this.store.row(id).transcript || record.transcript || "", error: record.error || "", sourceDeleted: record.sourceDeleted ?? this.store.row(id).sourceDeleted,
@@ -115,7 +120,9 @@ export class WorkspacePipeline {
     await this.patch(id, { locked: true, phase: "working", error: "", note: "等待 NotebookLM 转录" });
     try {
       const result = await this.api("extract-existing-sources", { sourceIds: [row.sourceId], sourceNames: { [row.sourceId]: row.sourceOriginalName || row.sourceName }, waitForReady: true, timeoutMs: 1_770_000, overallTimeoutMs: 1_770_000 });
-      await this.extracted(id, result.records?.[0] || { sourceId: row.sourceId, sourceName: row.sourceName, transcript: "", error: "未返回转录" });
+      const records=(result.records||[]).filter(r=>r.sourceId===row.sourceId);
+      if(records.length!==1)throw new Error("未返回唯一匹配的来源转录，来源保留。");
+      await this.extracted(id, records[0]);
     } catch (error) { await this.patch(id, { phase: "failed", error: error.message, note: "" }); }
   }
   private async driveRow(id: string) {
@@ -126,23 +133,30 @@ export class WorkspacePipeline {
       this.guard();
       const name = row.displayId ? `${row.displayId.replace(/[\\/:*?"<>|]/g, "_")}.${file.name.split(".").pop() || "mp4"}` : file.name;
       await this.patch(id, { sourceName: name, sourceOriginalName: name, note: "正在上传" }, stripSourceSuffix(file.name));
+      await this.patch(id,{creationUnconfirmed:true});
       const upload = await this.api("upload-media-source", { file: new File([file], name, { type: file.type }), options: { timeoutMs: 1_770_000 } });
+      if(!upload.sourceId)throw new Error("上传未返回来源编号，结果待确认。");
       await this.patch(id, { sourceId: upload.sourceId, sourceDeleted: false, note: "等待转录" });
+      await this.patch(id,{creationUnconfirmed:false});
       await this.extractRow(id);
     } catch (error) { await this.patch(id, { phase: "failed", error: error.message, note: "" }); }
   }
   private async facebook(ids: string[]) {
     const tasks = ids.map((id) => { const r = this.store.row(id); return { taskId: id, postId: r.displayId || `video_${id.replace(/-/g, "").slice(0, 12)}`, autoId: !r.displayId, url: r.url }; });
+    const rowByTask=new Map<string,string>();
+    for(const task of tasks){const rowId=task.taskId;task.taskId=`${this.runId}-${rowId}`;rowByTask.set(task.taskId,rowId);}
     const coordinator = new FacebookImportCoordinator({
+      onBatchSubmitting:async()=>{for(const id of ids)await this.patch(id,{creationUnconfirmed:true});},
       onBatchAccepted: async () => {
         for (const id of ids) await this.patch(id, { locked: true, phase: "working", error: "", note: "下载中" });
       },
       beforeNotebookRequest: () => this.guard(),
       onStage: (text) => this.report(text), onLog: (text) => this.report(text),
       onSourcePrepared: async (sourceId, id, name) => {
+        id=rowByTask.get(id)!;if(!id)throw new Error("未知的 Facebook 任务编号。");
         this.guard(); await this.patch(id, { sourceId, sourceName: name, sourceOriginalName: name, sourceDeleted: false, note: "等待转录" }, stripSourceSuffix(name));
       },
-      onRecord: (id, record) => this.extracted(id, record)
+      onRecord: (id, record) => {const rowId=rowByTask.get(id);if(!rowId)throw new Error("未知的 Facebook 结果编号。");return this.extracted(rowId, record);}
     });
     try {
       const records = await coordinator.start(tasks, false);
@@ -173,6 +187,7 @@ export class WorkspacePipeline {
           const result = await this.translate(batch.map((id) => this.store.row(id)), this.panel, () => this.paused,
             async (id, translation) => { await this.patch(id, { translation, translationPhase: "done", translationError: "" }); }, {
               stage: (text) => this.report(text),
+              binding: async(row)=>{await this.patch(row.rowId,{sourceName:row.sourceName,sourceOriginalName:row.sourceOriginalName});},
               request: async (ids, request) => { for (const id of ids) await this.patch(id, { translationRequest: request }); }
             });
           for (const id of batch) await this.patch(id, result.has(id)
@@ -253,11 +268,12 @@ export class WorkspacePipeline {
       for (const item of items) await this.patch(item.rowId, { registrationError: error.message });
       throw error;
     }
-    const analysis = analyzeBatchResponse(result, items.map((i) => i.data));
+    const confirmations = confirmedSheetOutcomes(result, items.map((i) => i.data));
+    const analysis = {success:confirmations.filter(Boolean).length,failed:confirmations.filter(v=>!v).length};
     const outcomes = result?.data?.results || [];
     for (const [index, item] of items.entries()) {
       const outcome = outcomes.find((r) => r.index === index || r.post_id === item.data.post_id);
-      const success = outcome ? outcome.success === true : analysis.failed === 0;
+      const success = confirmations[index];
       await this.patch(item.rowId, success ? { registeredKey: item.key, registeredTarget: sheetTarget(url), registered: true, registrationError: "" }
         : { registrationError: outcome?.error?.message || "登记失败或服务未确认该行，请重试。" });
     }

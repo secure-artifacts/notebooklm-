@@ -95,8 +95,9 @@ export function mergeTranslationPayload(payload: unknown, records: TranscriptRec
     const duplicate = (Array.isArray(payload) ? payload : []).filter((other) =>
       other && sourceNamesMatch(other.source_name, candidate.source_name)).length > 1;
     if (duplicate) { unknown.push(item); return; }
-    const index = unmatchedRecords.findIndex((record) =>
-      sourceNamesMatch(candidate.source_name, record.sourceOriginalName || record.sourceName));
+    const matches = unmatchedRecords.filter((record) => sourceNamesMatch(candidate.source_name, record.sourceOriginalName || record.sourceName));
+    if (matches.length !== 1) { unknown.push(item); return; }
+    const index = unmatchedRecords.indexOf(matches[0]);
     if (index < 0) {
       unknown.push(item);
       return;

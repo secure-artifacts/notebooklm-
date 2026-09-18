@@ -101,7 +101,7 @@ function findSourceArray(node: unknown, sourceId: string): JsonArray | null {
 export function extractSourceRecords(
   notebookPayload: unknown,
   projectId: string,
-  visibleNames: string[] = []
+  visibleNames: Record<string, string> = {}
 ): SourceRecord[] {
   const ids = Array.from(new Set(
     (safeStringify(notebookPayload).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) || [])
@@ -124,7 +124,7 @@ export function extractSourceRecords(
 
   return records.map((record, index) => ({
     ...record,
-    sourceName: visibleNames[index] || record.sourceName || `来源 ${index + 1}`
+    sourceName: visibleNames[record.sourceId] || record.sourceName || `来源 ${index + 1}`
   }));
 }
 

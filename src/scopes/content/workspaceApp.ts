@@ -3,6 +3,7 @@ import { WorkspacePipeline, type PipelineOptions } from "./workspacePipeline";
 import { RecordGrid } from "./recordGrid";
 import { extensionClient } from "./extensionClient";
 import { taskComplete, serializeTsv } from "@/lib/recordWorkspace";
+import { loadWorkspaceWhenCurrent } from "@/lib/workspaceAccess";
 import type { PanelSettings } from "@/types/messages";
 import "./workspace.css";
 
@@ -13,7 +14,10 @@ export function bootWorkspaceApp() {
     const id=location.pathname.match(/^\/notebook\/([0-9a-f-]+)\/?$/i)?.[1]||"";
     if(id===current)return;
     app?.dispose();current=id;
-    if(id){app=new WorkspaceApp(id);void app.mount().catch((error)=>app?.report(error.message,true));}
+    if(id){
+      const mounted=new WorkspaceApp(id);app=mounted;
+      void mounted.mount().catch((error)=>{if(app===mounted&&mounted.isCurrent())mounted.report(error.message,true);});
+    }
   };
   if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",sync,{once:true});else sync();
   window.setInterval(sync,700);
@@ -21,8 +25,9 @@ export function bootWorkspaceApp() {
 export class WorkspaceApp {
   root=document.createElement("section");
   store:WorkspaceClient;pipeline:WorkspacePipeline;grid?:RecordGrid;settings!:PanelSettings;
-  logs:string[]=[];disposed=false;private resize?:ResizeObserver;private saveTimer=0;
+  logs:string[]=[];disposed=false;private ready=false;private resize?:ResizeObserver;private saveTimer=0;
   constructor(id:string){this.store=new WorkspaceClient(id);this.pipeline=new WorkspacePipeline(this.store,this.root,(text,error)=>this.report(text,error),()=>this.render());}
+  isCurrent(){return !this.disposed&&location.pathname.replace(/\/$/, "")===`/notebook/${this.store.notebookId}`;}
   query<T extends HTMLElement=HTMLElement>(name:string){return this.root.querySelector<T>(`[data-role="${name}"]`)!;}
   async mount(){
     this.root.id=ID;this.root.className="nr-panel";
@@ -36,7 +41,8 @@ export class WorkspaceApp {
       <div class="nr-toolbar"><button data-action="extract">提取现有来源</button><button data-action="delete-sources">删除已添加的来源</button><span data-role="status">正在加载记录…</span></div>
       <details class="nr-logs"><summary>操作日志</summary><div data-role="logs"></div></details></main>`;
     document.documentElement.append(this.root);
-    const saved=await extensionClient.getSettings(); if(this.disposed)return;
+    this.root.querySelectorAll<HTMLInputElement|HTMLButtonElement>("input,button").forEach((control)=>control.disabled=true);
+    const saved=await extensionClient.getSettings(); if(!this.isCurrent())return;
     this.settings=saved.panel;
     this.query<HTMLInputElement>("database").value=saved.databaseUrl;
     this.query<HTMLInputElement>("translate").checked=saved.panel.aiTranslationEnabled;
@@ -44,12 +50,13 @@ export class WorkspaceApp {
     this.query<HTMLInputElement>("auto-register").checked=saved.panel.autoRegisterImported;
     this.query<HTMLInputElement>("translation-batch").value=String(saved.panel.aiTranslationBatchSize||5);
     this.query<HTMLInputElement>("batch").value=String(Math.min(20,saved.panel.driveBatchSize||10));
-    await this.store.load();if(this.disposed)return;
+    if(!await loadWorkspaceWhenCurrent(()=>this.store.load(),()=>this.isCurrent()))return;
     // Same tab after reload may release its abandoned lease; another tab is rejected.
     try{await this.store.command({type:"release"});}catch{this.report("此笔记本正在另一标签页处理；此处仅查看。",true);}
+    if(!this.isCurrent())return;
     this.grid=new RecordGrid(this.query("grid"),this.store,()=>this.pipeline.busy,(text)=>this.report(text,true));
     this.store.onChange=()=>{if(!this.disposed){this.grid?.render();this.render();}};
-    this.bind();this.layout();this.render();this.report(`已恢复 ${this.store.state.rows.length} 条记录。`);
+    this.ready=true;this.bind();this.layout();this.render();this.report(`已恢复 ${this.store.state.rows.length} 条记录。`);
   }
   options():PipelineOptions{
     return{translate:this.query<HTMLInputElement>("translate").checked,autoDelete:this.query<HTMLInputElement>("auto-delete").checked,
@@ -104,10 +111,10 @@ export class WorkspaceApp {
     this.query("count").textContent=`${rows.length} 条`;
     this.query("summary").textContent=`成功 ${rows.filter((r)=>taskComplete(r)).length} · 失败 ${rows.filter((r)=>r.error||r.translationError||r.registrationError).length}`;
     this.root.querySelectorAll<HTMLButtonElement>("[data-action]").forEach((button)=>{
-      button.disabled=busy&&!["pause","copy","minimize"].includes(button.dataset.action!);
+      button.disabled=!this.ready||(busy&&!["pause","copy","minimize"].includes(button.dataset.action!));
       if(button.dataset.action==="pause"){button.hidden=!busy;button.disabled=this.pipeline.paused;}
     });
-    for(const role of ["translate","auto-delete","auto-register","batch","translation-batch","database"])this.query<HTMLInputElement>(role).disabled=busy;
+    for(const role of ["translate","auto-delete","auto-register","batch","translation-batch","database"])this.query<HTMLInputElement>(role).disabled=!this.ready||busy;
   }
   report(text:string,error=false){
     if(this.disposed)return;

@@ -54,18 +54,22 @@ export async function mapConcurrent<T, R>(
   const input = Array.isArray(items) ? items : [];
   const results = new Array<R>(input.length);
   const workerCount = Math.min(input.length, Math.max(1, Number.parseInt(String(concurrency || ""), 10) || 1));
-  let nextIndex = 0;
+    let nextIndex = 0;
+    let failed = false;
 
   async function worker(): Promise<void> {
-    while (true) {
+      while (!failed) {
       const index = nextIndex;
       nextIndex += 1;
       if (index >= input.length) return;
-      results[index] = await mapper(input[index], index);
+        try { results[index] = await mapper(input[index], index); }
+        catch(error) { failed=true; throw error; }
     }
   }
 
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    const settled = await Promise.allSettled(Array.from({ length: workerCount }, () => worker()));
+    const failure=settled.find((r):r is PromiseRejectedResult=>r.status==="rejected");
+    if(failure)throw failure.reason;
   return results;
 }
 

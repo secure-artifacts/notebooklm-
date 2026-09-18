@@ -20,6 +20,7 @@ import {
 } from "./colabRuntimeManager";
 import { upsertSheetRecords } from "./sheetService";
 import { loadWorkspace, changeWorkspace } from "./recordWorkspaceStore";
+import { validateWorkspaceAccess } from "@/lib/workspaceAccess";
 import {
   clearFacebookJob,
   loadFacebookJob,
@@ -60,7 +61,8 @@ async function handleRuntimeRequest(action: string | undefined, payload: any, se
   if (action === "loadWorkspace" || action === "changeWorkspace") {
     if (!isNotebookSender(sender) || sender.tab?.id === undefined) throw new Error("记录请求来源无效。");
     const notebookId = String(payload?.notebookId || "");
-    if (new URL(sender.url || sender.tab.url || "").pathname.replace(/\/$/, "") !== `/notebook/${notebookId}`) throw new Error("记录与当前笔记本不匹配。");
+    const liveTab = await chrome.tabs.get(sender.tab.id);
+    validateWorkspaceAccess(sender, liveTab.url, notebookId);
     return action === "loadWorkspace" ? loadWorkspace(notebookId)
       : changeWorkspace(notebookId, payload.revision, payload.command, sender.tab.id);
   }

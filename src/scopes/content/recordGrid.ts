@@ -14,6 +14,7 @@ export class RecordGrid {
   private head: HTMLElement;
   private widths: number[];
   private disposed = false;
+  private rowOrder:string[]=[];
   private observer: ResizeObserver;
   constructor(readonly host: HTMLElement, readonly store: WorkspaceClient, readonly busy: () => boolean, readonly report: (text: string) => void) {
     this.widths = [...store.state.widths];
@@ -54,6 +55,14 @@ export class RecordGrid {
   private template() { return `32px ${this.widths.map((w) => `${w}px`).join(" ")}`; }
   render() {
     if (this.disposed) return;
+    const nextOrder=this.store.state.rows.map(r=>r.rowId);
+    if(this.rowOrder.length && this.rowOrder.some((id,i)=>id!==nextOrder[i])) {
+      for(const cell of [this.anchor,this.focus]) {
+        const id=this.rowOrder[cell.row],index=id?nextOrder.indexOf(id):-1;
+        cell.row=index>=0?index:Math.min(cell.row,nextOrder.length);
+      }
+    }
+    this.rowOrder=nextOrder;
     for (const id of this.selected) if (!this.store.state.rows.some((r) => r.rowId === id)) this.selected.delete(id);
     if (!this.editor) this.widths = [...this.store.state.widths];
     this.head.style.gridTemplateColumns = this.template();

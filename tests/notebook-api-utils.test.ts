@@ -38,7 +38,7 @@ test("source status distinguishes ready and failed states", () => {
 
 test("extractSourceRecords applies visible names while keeping stable source ids", () => {
   const entry = [[SOURCE_ID], "internal-name.mp3", ["audio/mpeg", BLOB_ID], [null, 2]];
-  const records = utils.extractSourceRecords([PROJECT_ID, [entry]], PROJECT_ID, ["界面名称.mp3"]);
+  const records = utils.extractSourceRecords([PROJECT_ID, [entry]], PROJECT_ID, { [SOURCE_ID]: "界面名称.mp3" });
   assert.deepEqual(records, [{ sourceId: SOURCE_ID, sourceName: "界面名称.mp3" }]);
 });
 

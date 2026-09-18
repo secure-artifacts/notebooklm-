@@ -1,6 +1,6 @@
 import { extractJsonArrayCandidates } from "./aiTranslation";
 
-export type TranslationRequest = { id: string; prompt: string; createdAt: number };
+export type TranslationRequest = { id: string; prompt: string; createdAt: number; sources?: {rowId:string;sourceId:string;name:string}[] };
 export type ChatTurn = { role: "user" | "assistant"; text: string; complete?: boolean };
 
 // A unique marker belongs to the user turn, not to the generated text. Identical
